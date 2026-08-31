@@ -1,0 +1,1567 @@
+"""Quorum issuance and artifact-level verification of FedMERIT receipts."""
+
+from __future__ import annotations
+
+import sqlite3
+from contextlib import closing
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Sequence
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
+
+from .gate import (
+    PublicProbeRelease,
+    ProbeRelease,
+    RiskLedger,
+    gate_decision,
+    risk_is_satisfied,
+    verify_public_release,
+    verify_release,
+)
+from .canonical import canonical_bytes
+from .model import (
+    Candidate,
+    EvaluationPolicy,
+    Receipt,
+    ReceiptCore,
+    RiskSchedule,
+    StateContext,
+    WitnessSignature,
+    ZERO_HASH,
+)
+
+
+def _raw_public_key(public_key: Ed25519PublicKey) -> bytes:
+    return public_key.public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+
+
+def _require_digest(value: str, name: str) -> str:
+    if not isinstance(value, str) or len(value) != 64:
+        raise ValueError(f"{name} must be a SHA-256 digest")
+    try:
+        bytes.fromhex(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a SHA-256 digest") from exc
+    return value.lower()
+
+
+@dataclass(frozen=True)
+class VerificationTrust:
+    """Context-scoped verifier keys and Byzantine threshold."""
+
+    f: int
+    witness_public_keys: tuple[bytes, ...]
+    store_public_key: bytes
+    frame_public_key: bytes
+
+    def __post_init__(self) -> None:
+        if isinstance(self.f, bool) or not isinstance(self.f, int) or self.f < 0:
+            raise ValueError("f must be a non-negative integer")
+        if len(self.witness_public_keys) != 3 * self.f + 1:
+            raise ValueError("witness trust must contain exactly 3f+1 keys")
+        if (
+            any(len(key) != 32 for key in self.witness_public_keys)
+            or len(set(self.witness_public_keys)) != len(self.witness_public_keys)
+        ):
+            raise ValueError("witness trust keys must be distinct Ed25519 public keys")
+        if len(self.store_public_key) != 32 or len(self.frame_public_key) != 32:
+            raise ValueError("store and frame trust roots must be Ed25519 public keys")
+
+    @classmethod
+    def from_keys(
+        cls,
+        public_keys: Sequence[Ed25519PublicKey],
+        *,
+        f: int,
+        store_public_key: Ed25519PublicKey,
+        frame_public_key: Ed25519PublicKey,
+    ) -> "VerificationTrust":
+        return cls(
+            f=f,
+            witness_public_keys=tuple(_raw_public_key(key) for key in public_keys),
+            store_public_key=_raw_public_key(store_public_key),
+            frame_public_key=_raw_public_key(frame_public_key),
+        )
+
+
+def _replay_core(
+    candidate: Candidate,
+    release: ProbeRelease,
+    *,
+    store_public_key: Ed25519PublicKey,
+    frame_public_key: Ed25519PublicKey,
+    schedule: RiskSchedule,
+    risk_ledger: RiskLedger,
+    audit_registry: "AuditRegistry",
+) -> ReceiptCore:
+    audit_registry.validate_candidate(candidate)
+    audit_registry.require_risk_schedule(schedule)
+    allocation = schedule.allocation(candidate.risk_schedule_index)
+    if (
+        schedule.context_hash != candidate.context_hash
+        or schedule.schedule_hash != candidate.risk_schedule_hash
+        or allocation != candidate.risk
+    ):
+        raise ValueError("candidate does not match its predeclared risk schedule")
+    if not risk_ledger.is_consumed(
+        schedule.schedule_hash, candidate.risk_schedule_index, candidate.fixation_hash
+    ) or not risk_ledger.fixation_precedes_beacon(candidate):
+        raise ValueError(
+            "risk allocation was not fixed before its committed beacon round"
+        )
+    if not verify_release(release, candidate, store_public_key, frame_public_key):
+        raise ValueError("probe release token is invalid or not bound to the fixation")
+    if not risk_is_satisfied(
+        candidate.risk.group_count,
+        candidate.risk.epsilon,
+        candidate.risk.gamma,
+        candidate.risk.alpha,
+    ):
+        raise ValueError(
+            "precommitted source-group count does not satisfy the risk allocation"
+        )
+    _, delta_hat, decision = gate_decision(candidate, release.probe)
+    return ReceiptCore(
+        candidate.context_hash,
+        candidate.before_model_hash,
+        candidate.after_model_hash,
+        candidate.fixation_hash,
+        candidate.contributor_root,
+        candidate.score_probe_commitment,
+        candidate.probe_policy_hash,
+        release.release_hash,
+        candidate.risk_schedule_hash,
+        candidate.previous_receipt_hash,
+        candidate.risk.group_count,
+        candidate.risk.epsilon,
+        candidate.risk.gamma,
+        candidate.risk.alpha,
+        delta_hat,
+        decision,
+    )
+
+
+@dataclass(frozen=True)
+class Witness:
+    witness_index: int
+    private_key: Ed25519PrivateKey
+    state_path: str
+
+    @classmethod
+    def open(cls, witness_index: int, state_path: str | Path) -> "Witness":
+        path = Path(state_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(path, timeout=30, isolation_level=None)) as db:
+            db.executescript("""
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE IF NOT EXISTS witness_key(
+                    id INTEGER PRIMARY KEY CHECK(id=1), witness_index INTEGER UNIQUE NOT NULL,
+                    private_key BLOB NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS signed_scopes(
+                    context_hash TEXT NOT NULL, before_model_hash TEXT NOT NULL,
+                    previous_receipt_hash TEXT NOT NULL, receipt_hash TEXT NOT NULL,
+                    PRIMARY KEY(context_hash, before_model_hash, previous_receipt_hash)
+                );
+            """)
+            row = db.execute(
+                "SELECT witness_index, private_key FROM witness_key WHERE id=1"
+            ).fetchone()
+            if row is None:
+                private_key = Ed25519PrivateKey.generate()
+                raw = private_key.private_bytes(
+                    serialization.Encoding.Raw,
+                    serialization.PrivateFormat.Raw,
+                    serialization.NoEncryption(),
+                )
+                db.execute(
+                    "INSERT INTO witness_key VALUES(1,?,?)", (witness_index, raw)
+                )
+            else:
+                if int(row[0]) != witness_index:
+                    raise ValueError(
+                        "witness state belongs to a different witness index"
+                    )
+                private_key = Ed25519PrivateKey.from_private_bytes(bytes(row[1]))
+        return cls(witness_index, private_key, str(path))
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.state_path, timeout=30, isolation_level=None)
+
+    @property
+    def public_key(self) -> Ed25519PublicKey:
+        return self.private_key.public_key()
+
+    def _sign_core(self, core: ReceiptCore) -> WitnessSignature:
+        scope = (core.context_hash, core.before_model_hash, core.previous_receipt_hash)
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT receipt_hash FROM signed_scopes WHERE context_hash=? "
+                "AND before_model_hash=? AND previous_receipt_hash=?",
+                scope,
+            ).fetchone()
+            if row is not None and row[0] != core.receipt_hash:
+                db.rollback()
+                raise ValueError(
+                    "witness refuses a conflicting core for this attempt scope"
+                )
+            db.execute(
+                "INSERT OR IGNORE INTO signed_scopes VALUES(?,?,?,?)",
+                (*scope, core.receipt_hash),
+            )
+            db.commit()
+        return WitnessSignature(
+            self.witness_index, self.private_key.sign(core.to_bytes())
+        )
+
+    def attest(
+        self,
+        candidate: Candidate,
+        release: ProbeRelease,
+        *,
+        store_public_key: Ed25519PublicKey,
+        frame_public_key: Ed25519PublicKey,
+        schedule: RiskSchedule,
+        risk_ledger: RiskLedger,
+        audit_registry: "AuditRegistry",
+    ) -> tuple[ReceiptCore, WitnessSignature]:
+        core = _replay_core(
+            candidate,
+            release,
+            store_public_key=store_public_key,
+            frame_public_key=frame_public_key,
+            schedule=schedule,
+            risk_ledger=risk_ledger,
+            audit_registry=audit_registry,
+        )
+        return core, self._sign_core(core)
+
+
+class CertificateAuthority:
+    """Reference witness quorum; issuance derives all gate fields from fixation/release."""
+
+    def __init__(self, witnesses: list[Witness], f: int) -> None:
+        if isinstance(f, bool) or not isinstance(f, int) or f < 0:
+            raise ValueError("f must be a non-negative integer")
+        if len(witnesses) != 3 * f + 1:
+            raise ValueError("witness set must contain exactly 3f+1 members")
+        indices = tuple(w.witness_index for w in witnesses)
+        if indices != tuple(range(len(witnesses))):
+            raise ValueError("witness indices must be contiguous from zero")
+        public_keys = tuple(_raw_public_key(w.public_key) for w in witnesses)
+        if len(set(public_keys)) != len(public_keys):
+            raise ValueError("witness public keys must be distinct")
+        self.witnesses = tuple(witnesses)
+        self.f = f
+
+    @classmethod
+    def persistent(cls, directory: str | Path, f: int = 1) -> "CertificateAuthority":
+        if isinstance(f, bool) or not isinstance(f, int) or f < 0:
+            raise ValueError("f must be a non-negative integer")
+        root = Path(directory)
+        root.mkdir(parents=True, exist_ok=True)
+        return cls(
+            [Witness.open(i, root / f"witness-{i}.sqlite3") for i in range(3 * f + 1)],
+            f,
+        )
+
+    @property
+    def public_keys(self) -> tuple[Ed25519PublicKey, ...]:
+        return tuple(w.public_key for w in self.witnesses)
+
+    def issue(
+        self,
+        candidate: Candidate,
+        release: ProbeRelease,
+        *,
+        store_public_key: Ed25519PublicKey,
+        frame_public_key: Ed25519PublicKey,
+        schedule: RiskSchedule,
+        risk_ledger: RiskLedger,
+        audit_registry: "AuditRegistry",
+    ) -> Receipt:
+        """Collect independently replayed attestations from a threshold of witnesses."""
+        trust = VerificationTrust.from_keys(
+            self.public_keys,
+            f=self.f,
+            store_public_key=store_public_key,
+            frame_public_key=frame_public_key,
+        )
+        audit_registry.require_verification_trust(candidate.context_hash, trust)
+        core: ReceiptCore | None = None
+        signatures: list[WitnessSignature] = []
+        for witness in self.witnesses[: 2 * self.f + 1]:
+            replayed, signature = witness.attest(
+                candidate,
+                release,
+                store_public_key=store_public_key,
+                frame_public_key=frame_public_key,
+                schedule=schedule,
+                risk_ledger=risk_ledger,
+                audit_registry=audit_registry,
+            )
+            if core is not None and replayed != core:
+                raise ValueError("witness replay produced a conflicting receipt core")
+            core = replayed
+            signatures.append(signature)
+        if core is None:
+            raise RuntimeError("certificate issuance produced no witness replay")
+        receipt = Receipt(core, len(self.witnesses), tuple(signatures))
+        audit_registry.record_issued_receipt(
+            receipt,
+            candidate=candidate,
+            schedule=schedule,
+            verification_trust=trust,
+        )
+        return receipt
+
+
+def _core_matches_candidate(
+    core: ReceiptCore,
+    candidate: Candidate,
+    release: ProbeRelease | PublicProbeRelease,
+) -> bool:
+    return (
+        core.context_hash == candidate.context_hash
+        and core.before_model_hash == candidate.before_model_hash
+        and core.after_model_hash == candidate.after_model_hash
+        and core.fixation_hash == candidate.fixation_hash
+        and core.contributor_root == candidate.contributor_root
+        and core.score_probe_commitment == candidate.score_probe_commitment
+        and core.probe_policy_hash == candidate.probe_policy_hash
+        and core.release_hash == release.release_hash
+        and core.risk_schedule_hash == candidate.risk_schedule_hash
+        and core.previous_receipt_hash == candidate.previous_receipt_hash
+        and core.source_group_count == candidate.risk.group_count
+        and core.epsilon == candidate.risk.epsilon
+        and core.gamma == candidate.risk.gamma
+        and core.alpha == candidate.risk.alpha
+    )
+
+
+def _verify_public_receipt(
+    receipt: Receipt,
+    public_keys: Sequence[Ed25519PublicKey],
+    *,
+    f: int,
+    release: PublicProbeRelease,
+    candidate: Candidate,
+    store_public_key: Ed25519PublicKey,
+    frame_public_key: Ed25519PublicKey,
+    schedule: RiskSchedule,
+    risk_ledger: RiskLedger,
+    audit_registry: "AuditRegistry",
+) -> bool:
+    if f < 0 or len(public_keys) != 3 * f + 1:
+        return False
+    trust = VerificationTrust.from_keys(
+        public_keys,
+        f=f,
+        store_public_key=store_public_key,
+        frame_public_key=frame_public_key,
+    )
+    audit_registry.require_verification_trust(candidate.context_hash, trust)
+    encoded_public_keys = trust.witness_public_keys
+    if len(set(encoded_public_keys)) != len(encoded_public_keys):
+        return False
+    if receipt.witness_count != len(public_keys):
+        return False
+    if len(receipt.signatures) < 2 * f + 1:
+        return False
+    audit_registry.validate_candidate(candidate, receipt_hash=receipt.receipt_hash)
+    audit_registry.require_risk_schedule(schedule)
+    core = receipt.core
+    allocation = schedule.allocation(candidate.risk_schedule_index)
+    if (
+        schedule.context_hash != candidate.context_hash
+        or schedule.schedule_hash != candidate.risk_schedule_hash
+        or allocation != candidate.risk
+    ):
+        return False
+    if not risk_ledger.is_consumed(
+        schedule.schedule_hash, candidate.risk_schedule_index, candidate.fixation_hash
+    ) or not risk_ledger.fixation_precedes_beacon(candidate):
+        return False
+    if not verify_public_release(
+        release, candidate, store_public_key, frame_public_key
+    ):
+        return False
+    if not _core_matches_candidate(core, candidate, release):
+        return False
+    if not risk_is_satisfied(
+        core.source_group_count, core.epsilon, core.gamma, core.alpha
+    ):
+        return False
+    seen: set[int] = set()
+    for item in receipt.signatures:
+        if item.witness_index in seen or item.witness_index >= len(public_keys):
+            return False
+        public_keys[item.witness_index].verify(item.signature, core.to_bytes())
+        seen.add(item.witness_index)
+    return len(seen) >= 2 * f + 1
+
+
+def verify_public_receipt(
+    receipt: Receipt,
+    public_keys: Sequence[Ed25519PublicKey],
+    *,
+    f: int,
+    release: PublicProbeRelease,
+    candidate: Candidate,
+    store_public_key: Ed25519PublicKey,
+    frame_public_key: Ed25519PublicKey,
+    schedule: RiskSchedule,
+    risk_ledger: RiskLedger,
+    audit_registry: "AuditRegistry",
+) -> bool:
+    """Verify public bindings and quorum without receiving the raw probe opening."""
+    try:
+        return _verify_public_receipt(
+            receipt,
+            public_keys,
+            f=f,
+            release=release,
+            candidate=candidate,
+            store_public_key=store_public_key,
+            frame_public_key=frame_public_key,
+            schedule=schedule,
+            risk_ledger=risk_ledger,
+            audit_registry=audit_registry,
+        )
+    except Exception:
+        return False
+
+
+def _verify_receipt(
+    receipt: Receipt,
+    public_keys: Sequence[Ed25519PublicKey],
+    *,
+    f: int,
+    release: ProbeRelease,
+    candidate: Candidate,
+    store_public_key: Ed25519PublicKey,
+    frame_public_key: Ed25519PublicKey,
+    schedule: RiskSchedule,
+    risk_ledger: RiskLedger,
+    audit_registry: "AuditRegistry",
+) -> bool:
+    if not _verify_public_receipt(
+        receipt,
+        public_keys,
+        f=f,
+        release=release.public_release,
+        candidate=candidate,
+        store_public_key=store_public_key,
+        frame_public_key=frame_public_key,
+        schedule=schedule,
+        risk_ledger=risk_ledger,
+        audit_registry=audit_registry,
+    ):
+        return False
+    if not verify_release(release, candidate, store_public_key, frame_public_key):
+        return False
+    _, replay, decision = gate_decision(candidate, release.probe)
+    # Equality is intentional: signed binary64 is the deterministic evaluator output.
+    return receipt.core.delta_hat == replay and receipt.core.decision == decision
+
+
+def verify_receipt(
+    receipt: Receipt,
+    public_keys: Sequence[Ed25519PublicKey],
+    *,
+    f: int,
+    release: ProbeRelease,
+    candidate: Candidate,
+    store_public_key: Ed25519PublicKey,
+    frame_public_key: Ed25519PublicKey,
+    schedule: RiskSchedule,
+    risk_ledger: RiskLedger,
+    audit_registry: "AuditRegistry",
+) -> bool:
+    """Authorized raw-probe replay; return false for every malformed artifact."""
+
+    try:
+        return _verify_receipt(
+            receipt,
+            public_keys,
+            f=f,
+            release=release,
+            candidate=candidate,
+            store_public_key=store_public_key,
+            frame_public_key=frame_public_key,
+            schedule=schedule,
+            risk_ledger=risk_ledger,
+            audit_registry=audit_registry,
+        )
+    except Exception:
+        return False
+
+
+def verify_receipt_bytes(
+    payload: bytes,
+    *,
+    witness_count: int,
+    public_keys: Sequence[Ed25519PublicKey],
+    f: int,
+    release: ProbeRelease,
+    candidate: Candidate,
+    store_public_key: Ed25519PublicKey,
+    frame_public_key: Ed25519PublicKey,
+    schedule: RiskSchedule,
+    risk_ledger: RiskLedger,
+    audit_registry: "AuditRegistry",
+) -> bool:
+    try:
+        receipt = Receipt.from_bytes(payload, witness_count=witness_count)
+    except Exception:
+        return False
+    return verify_receipt(
+        receipt,
+        public_keys,
+        f=f,
+        release=release,
+        candidate=candidate,
+        store_public_key=store_public_key,
+        frame_public_key=frame_public_key,
+        schedule=schedule,
+        risk_ledger=risk_ledger,
+        audit_registry=audit_registry,
+    )
+
+
+class AuditRegistry:
+    """Durable authenticated receipt head and installed-model registry."""
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        genesis_model_hash: str,
+        initial_context: StateContext,
+        evaluation_policy: EvaluationPolicy,
+        verification_trust: VerificationTrust | None = None,
+    ) -> None:
+        if str(path) == ":memory:":
+            raise ValueError("audit registry must use durable storage")
+        genesis_model_hash = _require_digest(genesis_model_hash, "genesis_model_hash")
+        if initial_context.policy_hash != evaluation_policy.policy_hash:
+            raise ValueError("initial context does not authorize the evaluation policy")
+        self.path = str(path)
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with closing(self._connect()) as db:
+            db.executescript("""
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE IF NOT EXISTS audit_state(
+                    id INTEGER PRIMARY KEY CHECK(id=1), head TEXT NOT NULL,
+                    installed_model_hash TEXT NOT NULL, genesis_model_hash TEXT NOT NULL,
+                    installed_model_version INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS context_head(
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    context_hash TEXT NOT NULL,
+                    authority_certificate_hash TEXT NOT NULL,
+                    policy_hash TEXT NOT NULL,
+                    twin_id TEXT NOT NULL,
+                    state_version INTEGER NOT NULL,
+                    model_version INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS evaluation_policies(
+                    policy_hash TEXT PRIMARY KEY, policy_blob BLOB NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS registered_contexts(
+                    context_hash TEXT PRIMARY KEY, context_blob BLOB NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS verification_trust(
+                    context_hash TEXT PRIMARY KEY, trust_blob BLOB NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS issued_receipts(
+                    receipt_hash TEXT PRIMARY KEY, context_hash TEXT NOT NULL,
+                    before_model_hash TEXT NOT NULL, after_model_hash TEXT NOT NULL,
+                    previous_receipt_hash TEXT NOT NULL,
+                    fixation_hash TEXT NOT NULL, schedule_hash TEXT NOT NULL,
+                    schedule_index INTEGER NOT NULL,
+                    UNIQUE(context_hash, before_model_hash, previous_receipt_hash),
+                    UNIQUE(schedule_hash, schedule_index)
+                );
+                CREATE TABLE IF NOT EXISTS receipts(
+                    receipt_hash TEXT PRIMARY KEY, context_hash TEXT NOT NULL,
+                    before_model_hash TEXT NOT NULL, after_model_hash TEXT NOT NULL,
+                    previous_receipt_hash TEXT NOT NULL,
+                    fixation_hash TEXT NOT NULL, schedule_hash TEXT NOT NULL,
+                    schedule_index INTEGER NOT NULL,
+                    UNIQUE(context_hash, before_model_hash, previous_receipt_hash),
+                    UNIQUE(schedule_hash, schedule_index)
+                );
+                CREATE TABLE IF NOT EXISTS retired_source_manifests(
+                    source_manifest_hash TEXT PRIMARY KEY,
+                    context_hash TEXT NOT NULL,
+                    fixation_hash TEXT NOT NULL,
+                    probe_id_hash TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS risk_schedules(
+                    schedule_hash TEXT PRIMARY KEY,
+                    context_hash TEXT UNIQUE NOT NULL,
+                    anchor_receipt_hash TEXT NOT NULL,
+                    lifetime_delta REAL NOT NULL,
+                    schedule_blob BLOB NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS spent_risk_allocations(
+                    schedule_hash TEXT NOT NULL,
+                    allocation_index INTEGER NOT NULL,
+                    context_hash TEXT NOT NULL,
+                    fixation_hash TEXT NOT NULL,
+                    PRIMARY KEY(schedule_hash, allocation_index)
+                );
+            """)
+            context_columns = tuple(
+                row[1] for row in db.execute("PRAGMA table_info(context_head)")
+            )
+            receipt_columns = tuple(
+                row[1] for row in db.execute("PRAGMA table_info(receipts)")
+            )
+            audit_columns = tuple(
+                row[1] for row in db.execute("PRAGMA table_info(audit_state)")
+            )
+            if (
+                "policy_hash" not in context_columns
+                or "after_model_hash" not in receipt_columns
+            ):
+                raise ValueError(
+                    "legacy audit registry requires explicit schema migration"
+                )
+            for column, column_type in (
+                ("twin_id", "TEXT"),
+                ("state_version", "INTEGER"),
+                ("model_version", "INTEGER"),
+            ):
+                if column not in context_columns:
+                    db.execute(
+                        f"ALTER TABLE context_head ADD COLUMN {column} {column_type}"
+                    )
+            if "installed_model_version" not in audit_columns:
+                db.execute(
+                    "ALTER TABLE audit_state ADD COLUMN installed_model_version INTEGER"
+                )
+                db.execute(
+                    "UPDATE audit_state SET installed_model_version=? "
+                    "WHERE installed_model_version IS NULL",
+                    (initial_context.model_version,),
+                )
+            row = db.execute(
+                "SELECT genesis_model_hash FROM audit_state WHERE id=1"
+            ).fetchone()
+            if row is None:
+                db.execute(
+                    "INSERT INTO audit_state "
+                    "(id, head, installed_model_hash, genesis_model_hash, "
+                    "installed_model_version) VALUES(1,?,?,?,?)",
+                    (
+                        ZERO_HASH,
+                        genesis_model_hash,
+                        genesis_model_hash,
+                        initial_context.model_version,
+                    ),
+                )
+            elif row[0] != genesis_model_hash:
+                raise ValueError(
+                    "audit registry was initialized for another genesis model"
+                )
+            context_row = db.execute(
+                "SELECT context_hash, authority_certificate_hash, policy_hash, "
+                "twin_id, state_version, model_version FROM context_head WHERE id=1"
+            ).fetchone()
+            if context_row is None:
+                db.execute(
+                    "INSERT INTO context_head "
+                    "(id, context_hash, authority_certificate_hash, policy_hash, "
+                    "twin_id, state_version, model_version) VALUES(1,?,?,?,?,?,?)",
+                    (
+                        initial_context.context_hash,
+                        initial_context.authority_certificate_hash,
+                        evaluation_policy.policy_hash,
+                        initial_context.twin_id,
+                        initial_context.state_version,
+                        initial_context.model_version,
+                    ),
+                )
+            else:
+                expected_context_row = (
+                    initial_context.context_hash,
+                    initial_context.authority_certificate_hash,
+                    evaluation_policy.policy_hash,
+                    initial_context.twin_id,
+                    initial_context.state_version,
+                    initial_context.model_version,
+                )
+                if context_row[:3] != expected_context_row[:3]:
+                    raise ValueError(
+                        "provided initial context does not match the provisioned live context"
+                    )
+                if context_row[3:] == (None, None, None):
+                    db.execute(
+                        "UPDATE context_head SET twin_id=?, state_version=?, model_version=? "
+                        "WHERE id=1",
+                        expected_context_row[3:],
+                    )
+                elif context_row[3:] != expected_context_row[3:]:
+                    raise ValueError(
+                        "stored context identity or version disagrees with its live descriptor"
+                    )
+            policy_blob = canonical_bytes(evaluation_policy)
+            registered = db.execute(
+                "SELECT policy_blob FROM evaluation_policies WHERE policy_hash=?",
+                (evaluation_policy.policy_hash,),
+            ).fetchone()
+            if registered is not None and bytes(registered[0]) != policy_blob:
+                raise ValueError("evaluation policy hash is bound to different content")
+            db.execute(
+                "INSERT OR IGNORE INTO evaluation_policies VALUES(?,?)",
+                (evaluation_policy.policy_hash, policy_blob),
+            )
+            context_blob = canonical_bytes(initial_context)
+            registered_context = db.execute(
+                "SELECT context_blob FROM registered_contexts WHERE context_hash=?",
+                (initial_context.context_hash,),
+            ).fetchone()
+            if registered_context is not None and bytes(registered_context[0]) != context_blob:
+                raise ValueError("context hash is bound to different content")
+            db.execute(
+                "INSERT OR IGNORE INTO registered_contexts VALUES(?,?)",
+                (initial_context.context_hash, context_blob),
+            )
+            if verification_trust is not None:
+                self._provision_trust_locked(
+                    db, initial_context.context_hash, verification_trust
+                )
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.path, timeout=30, isolation_level=None)
+
+    @property
+    def head(self) -> str:
+        with closing(self._connect()) as db:
+            return str(
+                db.execute("SELECT head FROM audit_state WHERE id=1").fetchone()[0]
+            )
+
+    @property
+    def installed_model_hash(self) -> str:
+        with closing(self._connect()) as db:
+            return str(
+                db.execute(
+                    "SELECT installed_model_hash FROM audit_state WHERE id=1"
+                ).fetchone()[0]
+            )
+
+    @property
+    def installed_model_version(self) -> int:
+        with closing(self._connect()) as db:
+            return int(
+                db.execute(
+                    "SELECT installed_model_version FROM audit_state WHERE id=1"
+                ).fetchone()[0]
+            )
+
+    @staticmethod
+    def _provision_trust_locked(
+        db: sqlite3.Connection,
+        context_hash: str,
+        trust: VerificationTrust,
+    ) -> None:
+        if not isinstance(trust, VerificationTrust):
+            raise TypeError("verification_trust must be a VerificationTrust")
+        trust_blob = canonical_bytes(trust)
+        existing = db.execute(
+            "SELECT trust_blob FROM verification_trust WHERE context_hash=?",
+            (context_hash,),
+        ).fetchone()
+        if existing is not None and bytes(existing[0]) != trust_blob:
+            raise ValueError("context is already bound to different verification roots")
+        db.execute(
+            "INSERT OR IGNORE INTO verification_trust VALUES(?,?)",
+            (context_hash, trust_blob),
+        )
+
+    def provision_verification_trust(
+        self,
+        trust: VerificationTrust,
+        *,
+        context_hash: str | None = None,
+    ) -> None:
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            selected = context_hash
+            if selected is None:
+                selected = str(
+                    db.execute(
+                        "SELECT context_hash FROM context_head WHERE id=1"
+                    ).fetchone()[0]
+                )
+            if db.execute(
+                "SELECT 1 FROM registered_contexts WHERE context_hash=?", (selected,)
+            ).fetchone() is None:
+                db.rollback()
+                raise ValueError("verification roots require a registered context")
+            self._provision_trust_locked(db, selected, trust)
+            db.commit()
+
+    def require_verification_trust(
+        self, context_hash: str, trust: VerificationTrust
+    ) -> None:
+        expected = canonical_bytes(trust)
+        with closing(self._connect()) as db:
+            row = db.execute(
+                "SELECT trust_blob FROM verification_trust WHERE context_hash=?",
+                (context_hash,),
+            ).fetchone()
+        if row is None or bytes(row[0]) != expected:
+            raise ValueError("verification keys are not authorized by the context")
+
+    @property
+    def context_head(self) -> tuple[str, str]:
+        """Return the live context and authority certificate digests."""
+        with closing(self._connect()) as db:
+            row = db.execute(
+                "SELECT context_hash, authority_certificate_hash FROM context_head "
+                "WHERE id=1"
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("context head is not initialized")
+        return str(row[0]), str(row[1])
+
+    def evaluation_policy_registered(self, policy: EvaluationPolicy) -> bool:
+        with closing(self._connect()) as db:
+            row = db.execute(
+                "SELECT policy_blob FROM evaluation_policies WHERE policy_hash=?",
+                (policy.policy_hash,),
+            ).fetchone()
+        return row is not None and bytes(row[0]) == canonical_bytes(policy)
+
+    @staticmethod
+    def _require_risk_schedule_locked(
+        db: sqlite3.Connection, schedule: RiskSchedule
+    ) -> None:
+        row = db.execute(
+            "SELECT context_hash, anchor_receipt_hash, lifetime_delta, schedule_blob "
+            "FROM risk_schedules WHERE schedule_hash=?",
+            (schedule.schedule_hash,),
+        ).fetchone()
+        expected = (
+            schedule.context_hash,
+            schedule.anchor_receipt_hash,
+            schedule.lifetime_delta,
+            canonical_bytes(schedule),
+        )
+        if row is None or (
+            str(row[0]), str(row[1]), float(row[2]), bytes(row[3])
+        ) != expected:
+            raise ValueError("risk schedule is not canonically registered")
+
+    def register_risk_schedule(self, schedule: RiskSchedule) -> None:
+        """Freeze exactly one lifetime schedule for the live context lineage."""
+        if not isinstance(schedule, RiskSchedule):
+            raise TypeError("schedule must be a RiskSchedule")
+        blob = canonical_bytes(schedule)
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            prior = db.execute(
+                "SELECT schedule_hash, anchor_receipt_hash, lifetime_delta, "
+                "schedule_blob FROM risk_schedules WHERE context_hash=?",
+                (schedule.context_hash,),
+            ).fetchone()
+            if prior is not None:
+                exact = (
+                    str(prior[0]) == schedule.schedule_hash
+                    and str(prior[1]) == schedule.anchor_receipt_hash
+                    and float(prior[2]) == schedule.lifetime_delta
+                    and bytes(prior[3]) == blob
+                )
+                if not exact:
+                    db.rollback()
+                    raise ValueError(
+                        "a different lifetime schedule is already frozen for this context"
+                    )
+                db.commit()
+                return
+            live_context = str(
+                db.execute(
+                    "SELECT context_hash FROM context_head WHERE id=1"
+                ).fetchone()[0]
+            )
+            head = str(
+                db.execute("SELECT head FROM audit_state WHERE id=1").fetchone()[0]
+            )
+            if schedule.context_hash != live_context:
+                db.rollback()
+                raise ValueError("risk schedule does not belong to the live context")
+            if schedule.anchor_receipt_hash != head:
+                db.rollback()
+                raise ValueError(
+                    "risk schedule is not anchored to the authenticated audit head"
+                )
+            try:
+                db.execute(
+                    "INSERT INTO risk_schedules VALUES(?,?,?,?,?)",
+                    (
+                        schedule.schedule_hash,
+                        schedule.context_hash,
+                        schedule.anchor_receipt_hash,
+                        schedule.lifetime_delta,
+                        blob,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                db.rollback()
+                raise ValueError("conflicting canonical risk schedule") from exc
+            db.commit()
+
+    def require_risk_schedule(self, schedule: RiskSchedule) -> None:
+        """Require byte-exact membership in the canonical schedule registry."""
+        with closing(self._connect()) as db:
+            self._require_risk_schedule_locked(db, schedule)
+
+    @staticmethod
+    def _require_risk_allocation_locked(
+        db: sqlite3.Connection,
+        schedule: RiskSchedule,
+        allocation_index: int,
+        fixation_hash: str,
+    ) -> None:
+        row = db.execute(
+            "SELECT context_hash, fixation_hash FROM spent_risk_allocations "
+            "WHERE schedule_hash=? AND allocation_index=?",
+            (schedule.schedule_hash, allocation_index),
+        ).fetchone()
+        if row != (schedule.context_hash, fixation_hash):
+            raise ValueError("risk allocation is not canonically spent for this fixation")
+
+    def reserve_risk_allocation(
+        self,
+        schedule: RiskSchedule,
+        allocation_index: int,
+        *,
+        fixation_hash: str,
+    ) -> None:
+        """Durably spend one canonical schedule entry before probe retirement."""
+        schedule.allocation(allocation_index)
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._require_risk_schedule_locked(db, schedule)
+            prior = db.execute(
+                "SELECT context_hash, fixation_hash FROM spent_risk_allocations "
+                "WHERE schedule_hash=? AND allocation_index=?",
+                (schedule.schedule_hash, allocation_index),
+            ).fetchone()
+            owner = (schedule.context_hash, fixation_hash)
+            if prior is not None:
+                if tuple(prior) != owner:
+                    db.rollback()
+                    raise ValueError(
+                        "risk allocation has already been spent by another fixation"
+                    )
+                db.commit()
+                return
+            db.execute(
+                "INSERT INTO spent_risk_allocations VALUES(?,?,?,?)",
+                (
+                    schedule.schedule_hash,
+                    allocation_index,
+                    schedule.context_hash,
+                    fixation_hash,
+                ),
+            )
+            db.commit()
+
+    def handover(
+        self,
+        *,
+        state_context: StateContext,
+        evaluation_policy: EvaluationPolicy,
+        verification_trust: VerificationTrust | None = None,
+    ) -> None:
+        """Atomically replace the live authority head before a new append."""
+        if state_context.policy_hash != evaluation_policy.policy_hash:
+            raise ValueError("successor context does not authorize its policy")
+        policy_blob = canonical_bytes(evaluation_policy)
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            live = db.execute(
+                "SELECT context_hash, twin_id, state_version FROM context_head WHERE id=1"
+            ).fetchone()
+            if live is None:
+                db.rollback()
+                raise RuntimeError("context head is not initialized")
+            live_context_hash, live_twin, live_state_version = live
+            if state_context.twin_id != live_twin:
+                db.rollback()
+                raise ValueError("successor context must preserve the twin identity")
+            if state_context.state_version != int(live_state_version) + 1:
+                db.rollback()
+                raise ValueError(
+                    "handover requires the immediate successor state version"
+                )
+            installed_model_version = int(
+                db.execute(
+                    "SELECT installed_model_version FROM audit_state WHERE id=1"
+                ).fetchone()[0]
+            )
+            if state_context.model_version != installed_model_version:
+                db.rollback()
+                raise ValueError(
+                    "handover model version must equal the installed model version"
+                )
+            registered = db.execute(
+                "SELECT policy_blob FROM evaluation_policies WHERE policy_hash=?",
+                (evaluation_policy.policy_hash,),
+            ).fetchone()
+            if registered is not None and bytes(registered[0]) != policy_blob:
+                db.rollback()
+                raise ValueError("evaluation policy hash is bound to different content")
+            db.execute(
+                "INSERT OR IGNORE INTO evaluation_policies VALUES(?,?)",
+                (evaluation_policy.policy_hash, policy_blob),
+            )
+            context_blob = canonical_bytes(state_context)
+            existing_context = db.execute(
+                "SELECT context_blob FROM registered_contexts WHERE context_hash=?",
+                (state_context.context_hash,),
+            ).fetchone()
+            if existing_context is not None and bytes(existing_context[0]) != context_blob:
+                db.rollback()
+                raise ValueError("context hash is bound to different content")
+            db.execute(
+                "INSERT OR IGNORE INTO registered_contexts VALUES(?,?)",
+                (state_context.context_hash, context_blob),
+            )
+            if verification_trust is None:
+                inherited = db.execute(
+                    "SELECT trust_blob FROM verification_trust WHERE context_hash=?",
+                    (live_context_hash,),
+                ).fetchone()
+                if inherited is not None:
+                    existing_trust = db.execute(
+                        "SELECT trust_blob FROM verification_trust WHERE context_hash=?",
+                        (state_context.context_hash,),
+                    ).fetchone()
+                    if existing_trust is not None and bytes(existing_trust[0]) != bytes(
+                        inherited[0]
+                    ):
+                        db.rollback()
+                        raise ValueError(
+                            "successor context is bound to different verification roots"
+                        )
+                    db.execute(
+                        "INSERT OR IGNORE INTO verification_trust VALUES(?,?)",
+                        (state_context.context_hash, bytes(inherited[0])),
+                    )
+            else:
+                self._provision_trust_locked(
+                    db, state_context.context_hash, verification_trust
+                )
+            db.execute(
+                "UPDATE context_head SET context_hash=?, authority_certificate_hash=?, "
+                "policy_hash=?, twin_id=?, state_version=?, model_version=? "
+                "WHERE id=1",
+                (
+                    state_context.context_hash,
+                    state_context.authority_certificate_hash,
+                    evaluation_policy.policy_hash,
+                    state_context.twin_id,
+                    state_context.state_version,
+                    state_context.model_version,
+                ),
+            )
+            db.commit()
+
+    def validate_candidate(
+        self, candidate: Candidate, *, receipt_hash: str | None = None
+    ) -> None:
+        with closing(self._connect()) as db:
+            head, installed = db.execute(
+                "SELECT head, installed_model_hash FROM audit_state WHERE id=1"
+            ).fetchone()
+            live_context, live_authority, live_policy = db.execute(
+                "SELECT context_hash, authority_certificate_hash, policy_hash FROM context_head "
+                "WHERE id=1"
+            ).fetchone()
+            policy_row = db.execute(
+                "SELECT policy_blob FROM evaluation_policies WHERE policy_hash=?",
+                (candidate.evaluation_policy.policy_hash,),
+            ).fetchone()
+            if policy_row is None or bytes(policy_row[0]) != canonical_bytes(
+                candidate.evaluation_policy
+            ):
+                raise ValueError("candidate evaluation policy is not registered")
+            context_row = db.execute(
+                "SELECT context_blob FROM registered_contexts WHERE context_hash=?",
+                (candidate.context_hash,),
+            ).fetchone()
+            if context_row is None or bytes(context_row[0]) != canonical_bytes(
+                candidate.state_context
+            ):
+                raise ValueError("candidate context is not registered")
+            historical = None
+            if receipt_hash is not None:
+                historical = db.execute(
+                    "SELECT context_hash, before_model_hash, after_model_hash, "
+                    "previous_receipt_hash, fixation_hash, schedule_hash, schedule_index "
+                    "FROM issued_receipts WHERE receipt_hash=?",
+                    (receipt_hash,),
+                ).fetchone()
+                expected_historical = (
+                    candidate.context_hash,
+                    candidate.before_model_hash,
+                    candidate.after_model_hash,
+                    candidate.previous_receipt_hash,
+                    candidate.fixation_hash,
+                    candidate.risk_schedule_hash,
+                    candidate.risk_schedule_index,
+                )
+                if historical is not None:
+                    if historical == expected_historical:
+                        return
+                    raise ValueError(
+                        "receipt hash is bound to another historical issuance"
+                    )
+                historical = db.execute(
+                    "SELECT context_hash, before_model_hash, after_model_hash, "
+                    "previous_receipt_hash, fixation_hash, schedule_hash, schedule_index "
+                    "FROM receipts WHERE receipt_hash=?",
+                    (receipt_hash,),
+                ).fetchone()
+                if historical is not None:
+                    if historical == expected_historical:
+                        return
+                    raise ValueError("receipt hash is bound to another historical append")
+            candidate_authority = candidate.state_context.authority_certificate_hash
+            if (
+                live_context != candidate.context_hash
+                or live_authority != candidate_authority
+                or live_policy != candidate.evaluation_policy.policy_hash
+            ):
+                raise ValueError("candidate does not match the live context head")
+            installed_model_version = int(
+                db.execute(
+                    "SELECT installed_model_version FROM audit_state WHERE id=1"
+                ).fetchone()[0]
+            )
+            if candidate.state_context.model_version != installed_model_version:
+                raise ValueError("candidate model version differs from installed state")
+            if (
+                candidate.previous_receipt_hash == head
+                and candidate.before_model_hash == installed
+            ):
+                return
+        if candidate.previous_receipt_hash != head:
+            raise ValueError("candidate does not extend the authenticated audit head")
+        raise ValueError("candidate before-model differs from installed chain state")
+
+    def record_issued_receipt(
+        self,
+        receipt: Receipt,
+        *,
+        candidate: Candidate,
+        schedule: RiskSchedule,
+        verification_trust: VerificationTrust,
+    ) -> None:
+        core = receipt.core
+        if (
+            core.context_hash != candidate.context_hash
+            or core.before_model_hash != candidate.before_model_hash
+            or core.after_model_hash != candidate.after_model_hash
+            or core.previous_receipt_hash != candidate.previous_receipt_hash
+            or core.fixation_hash != candidate.fixation_hash
+            or core.risk_schedule_hash != schedule.schedule_hash
+            or schedule.context_hash != candidate.context_hash
+            or schedule.allocation(candidate.risk_schedule_index) != candidate.risk
+        ):
+            raise ValueError("issued receipt is not bound to the candidate and schedule")
+        expected = (
+            candidate.context_hash,
+            candidate.before_model_hash,
+            candidate.after_model_hash,
+            candidate.previous_receipt_hash,
+            candidate.fixation_hash,
+            candidate.risk_schedule_hash,
+            candidate.risk_schedule_index,
+        )
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._require_risk_schedule_locked(db, schedule)
+            self._require_risk_allocation_locked(
+                db,
+                schedule,
+                candidate.risk_schedule_index,
+                candidate.fixation_hash,
+            )
+            trust_row = db.execute(
+                "SELECT trust_blob FROM verification_trust WHERE context_hash=?",
+                (candidate.context_hash,),
+            ).fetchone()
+            if trust_row is None or bytes(trust_row[0]) != canonical_bytes(
+                verification_trust
+            ):
+                db.rollback()
+                raise ValueError("verification keys are not authorized by the context")
+            live = db.execute(
+                "SELECT context_hash, authority_certificate_hash, policy_hash "
+                "FROM context_head WHERE id=1"
+            ).fetchone()
+            if live != (
+                candidate.context_hash,
+                candidate.state_context.authority_certificate_hash,
+                candidate.evaluation_policy.policy_hash,
+            ):
+                db.rollback()
+                raise ValueError("candidate lost the live context before issuance")
+            head, installed, installed_version = db.execute(
+                "SELECT head, installed_model_hash, installed_model_version "
+                "FROM audit_state WHERE id=1"
+            ).fetchone()
+            if (
+                candidate.previous_receipt_hash != head
+                or candidate.before_model_hash != installed
+                or candidate.state_context.model_version != int(installed_version)
+            ):
+                db.rollback()
+                raise ValueError("candidate lost the installed state before issuance")
+            existing = db.execute(
+                "SELECT context_hash, before_model_hash, after_model_hash, "
+                "previous_receipt_hash, fixation_hash, schedule_hash, schedule_index "
+                "FROM issued_receipts WHERE receipt_hash=?",
+                (receipt.receipt_hash,),
+            ).fetchone()
+            if existing is not None:
+                if existing != expected:
+                    db.rollback()
+                    raise ValueError("receipt hash is bound to another issuance")
+                db.commit()
+                return
+            try:
+                db.execute(
+                    "INSERT INTO issued_receipts VALUES(?,?,?,?,?,?,?,?)",
+                    (receipt.receipt_hash, *expected),
+                )
+            except sqlite3.IntegrityError as exc:
+                db.rollback()
+                raise ValueError("conflicting issued attempt or risk allocation") from exc
+            db.commit()
+
+    @staticmethod
+    def _reserve_source_manifests_locked(
+        db: sqlite3.Connection,
+        source_manifest_hashes: tuple[str, ...],
+        *,
+        context_hash: str,
+        fixation_hash: str,
+        probe_id_hash: str,
+    ) -> None:
+        manifests = tuple(source_manifest_hashes)
+        if not manifests or len(set(manifests)) != len(manifests):
+            raise ValueError("released source manifests must be non-empty and unique")
+        owner = (context_hash, fixation_hash, probe_id_hash)
+        for manifest in manifests:
+            prior = db.execute(
+                "SELECT context_hash, fixation_hash, probe_id_hash "
+                "FROM retired_source_manifests WHERE source_manifest_hash=?",
+                (manifest,),
+            ).fetchone()
+            if prior is not None and tuple(prior) != owner:
+                raise ValueError(
+                    "source manifest has already been retired by another release"
+                )
+        db.executemany(
+            "INSERT OR IGNORE INTO retired_source_manifests "
+            "(source_manifest_hash,context_hash,fixation_hash,probe_id_hash) "
+            "VALUES(?,?,?,?)",
+            ((manifest, *owner) for manifest in manifests),
+        )
+
+    def reserve_source_manifests(
+        self,
+        source_manifest_hashes: tuple[str, ...],
+        *,
+        context_hash: str,
+        fixation_hash: str,
+        probe_id_hash: str,
+    ) -> None:
+        """Reserve released source manifests before local probe retirement.
+
+        This is the lineage-wide fence.  It deliberately commits independently
+        of a probe-store transaction so a release followed by a handover cannot
+        make the same source evidence available to a successor catalog.
+        """
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                self._reserve_source_manifests_locked(
+                    db,
+                    source_manifest_hashes,
+                    context_hash=context_hash,
+                    fixation_hash=fixation_hash,
+                    probe_id_hash=probe_id_hash,
+                )
+            except Exception:
+                db.rollback()
+                raise
+            db.commit()
+
+    def _append(
+        self,
+        receipt: Receipt,
+        *,
+        candidate: Candidate,
+        schedule: RiskSchedule,
+        source_manifest_hashes: tuple[str, ...],
+        probe_id_hash: str,
+    ) -> None:
+        core = receipt.core
+        if core.fixation_hash != candidate.fixation_hash:
+            raise ValueError(
+                "receipt does not belong to the disclosed candidate fixation"
+            )
+        if (
+            schedule.context_hash != core.context_hash
+            or schedule.schedule_hash != core.risk_schedule_hash
+        ):
+            raise ValueError("receipt risk schedule is not registered for audit")
+        if schedule.allocation(candidate.risk_schedule_index) != candidate.risk:
+            raise ValueError("receipt risk allocation differs from the finite schedule")
+        if (
+            core.context_hash != candidate.context_hash
+            or core.before_model_hash != candidate.before_model_hash
+            or core.after_model_hash != candidate.after_model_hash
+            or core.previous_receipt_hash != candidate.previous_receipt_hash
+        ):
+            raise ValueError("receipt state fields differ from the candidate")
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._require_risk_schedule_locked(db, schedule)
+            self._require_risk_allocation_locked(
+                db,
+                schedule,
+                candidate.risk_schedule_index,
+                candidate.fixation_hash,
+            )
+            issued = db.execute(
+                "SELECT context_hash, before_model_hash, after_model_hash, "
+                "previous_receipt_hash, fixation_hash, schedule_hash, schedule_index "
+                "FROM issued_receipts WHERE receipt_hash=?",
+                (receipt.receipt_hash,),
+            ).fetchone()
+            expected_issued = (
+                core.context_hash,
+                core.before_model_hash,
+                core.after_model_hash,
+                core.previous_receipt_hash,
+                core.fixation_hash,
+                schedule.schedule_hash,
+                candidate.risk_schedule_index,
+            )
+            if issued != expected_issued:
+                db.rollback()
+                raise ValueError("receipt is not a registered issuance")
+            existing = db.execute(
+                "SELECT context_hash, before_model_hash, after_model_hash, "
+                "previous_receipt_hash, fixation_hash, schedule_hash, schedule_index "
+                "FROM receipts WHERE receipt_hash=?",
+                (receipt.receipt_hash,),
+            ).fetchone()
+            expected_existing = (
+                core.context_hash,
+                core.before_model_hash,
+                core.after_model_hash,
+                core.previous_receipt_hash,
+                core.fixation_hash,
+                schedule.schedule_hash,
+                candidate.risk_schedule_index,
+            )
+            if existing is not None:
+                if existing != expected_existing:
+                    db.rollback()
+                    raise ValueError(
+                        "receipt hash is bound to another historical append"
+                    )
+                db.commit()
+                return
+            live_context, live_authority, live_policy = db.execute(
+                "SELECT context_hash, authority_certificate_hash, policy_hash FROM context_head "
+                "WHERE id=1"
+            ).fetchone()
+            candidate_authority = candidate.state_context.authority_certificate_hash
+            if (
+                live_context != candidate.context_hash
+                or live_authority != candidate_authority
+                or live_policy != candidate.evaluation_policy.policy_hash
+            ):
+                db.rollback()
+                raise ValueError("CheckAppend context head mismatch")
+            head, installed, installed_version = db.execute(
+                "SELECT head, installed_model_hash, installed_model_version "
+                "FROM audit_state WHERE id=1"
+            ).fetchone()
+            if (
+                core.previous_receipt_hash != head
+                or core.before_model_hash != installed
+            ):
+                db.rollback()
+                raise ValueError(
+                    "receipt does not extend the current authenticated state"
+                )
+            if candidate.state_context.model_version != int(installed_version):
+                db.rollback()
+                raise ValueError("receipt model version differs from installed state")
+            successor_context = None
+            inherited_trust = None
+            if core.decision == "commit":
+                successor_context = candidate.state_context.model_successor()
+                if successor_context.model_version != int(installed_version) + 1:
+                    db.rollback()
+                    raise ValueError("model-successor version is not consecutive")
+                inherited_trust = db.execute(
+                    "SELECT trust_blob FROM verification_trust WHERE context_hash=?",
+                    (candidate.context_hash,),
+                ).fetchone()
+                if inherited_trust is None:
+                    db.rollback()
+                    raise ValueError(
+                        "committed model successor requires inherited verification roots"
+                    )
+                successor_blob = canonical_bytes(successor_context)
+                registered_successor = db.execute(
+                    "SELECT context_blob FROM registered_contexts WHERE context_hash=?",
+                    (successor_context.context_hash,),
+                ).fetchone()
+                if (
+                    registered_successor is not None
+                    and bytes(registered_successor[0]) != successor_blob
+                ):
+                    db.rollback()
+                    raise ValueError("successor context hash is bound to different content")
+                successor_trust = db.execute(
+                    "SELECT trust_blob FROM verification_trust WHERE context_hash=?",
+                    (successor_context.context_hash,),
+                ).fetchone()
+                if (
+                    successor_trust is not None
+                    and bytes(successor_trust[0]) != bytes(inherited_trust[0])
+                ):
+                    db.rollback()
+                    raise ValueError(
+                        "model successor is bound to different verification roots"
+                    )
+            self._reserve_source_manifests_locked(
+                db,
+                source_manifest_hashes,
+                context_hash=core.context_hash,
+                fixation_hash=core.fixation_hash,
+                probe_id_hash=probe_id_hash,
+            )
+            try:
+                db.execute(
+                    "INSERT INTO receipts VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        receipt.receipt_hash,
+                        core.context_hash,
+                        core.before_model_hash,
+                        core.after_model_hash,
+                        core.previous_receipt_hash,
+                        core.fixation_hash,
+                        schedule.schedule_hash,
+                        candidate.risk_schedule_index,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                db.rollback()
+                raise ValueError("conflicting scope or reused risk allocation") from exc
+            installed_next = (
+                core.after_model_hash
+                if core.decision == "commit"
+                else core.before_model_hash
+            )
+            installed_version_next = int(installed_version) + (
+                1 if core.decision == "commit" else 0
+            )
+            if successor_context is not None:
+                db.execute(
+                    "INSERT OR IGNORE INTO registered_contexts VALUES(?,?)",
+                    (
+                        successor_context.context_hash,
+                        canonical_bytes(successor_context),
+                    ),
+                )
+                db.execute(
+                    "INSERT OR IGNORE INTO verification_trust VALUES(?,?)",
+                    (
+                        successor_context.context_hash,
+                        bytes(inherited_trust[0]),
+                    ),
+                )
+                db.execute(
+                    "UPDATE context_head SET context_hash=?, "
+                    "authority_certificate_hash=?, policy_hash=?, twin_id=?, "
+                    "state_version=?, model_version=? WHERE id=1",
+                    (
+                        successor_context.context_hash,
+                        successor_context.authority_certificate_hash,
+                        successor_context.policy_hash,
+                        successor_context.twin_id,
+                        successor_context.state_version,
+                        successor_context.model_version,
+                    ),
+                )
+            db.execute(
+                "UPDATE audit_state SET head=?, installed_model_hash=?, "
+                "installed_model_version=? WHERE id=1",
+                (receipt.receipt_hash, installed_next, installed_version_next),
+            )
+            db.commit()
+
+    def verify_and_append(
+        self,
+        receipt: Receipt,
+        public_keys: Sequence[Ed25519PublicKey],
+        *,
+        f: int,
+        release: ProbeRelease,
+        candidate: Candidate,
+        store_public_key: Ed25519PublicKey,
+        frame_public_key: Ed25519PublicKey,
+        schedule: RiskSchedule,
+        risk_ledger: RiskLedger,
+    ) -> bool:
+        if not verify_receipt(
+            receipt,
+            public_keys,
+            f=f,
+            release=release,
+            candidate=candidate,
+            store_public_key=store_public_key,
+            frame_public_key=frame_public_key,
+            schedule=schedule,
+            risk_ledger=risk_ledger,
+            audit_registry=self,
+        ):
+            return False
+        try:
+            self._append(
+                receipt,
+                candidate=candidate,
+                schedule=schedule,
+                source_manifest_hashes=tuple(
+                    group.source_manifest_hash for group in release.probe.groups
+                ),
+                probe_id_hash=release.probe.probe_id_hash,
+            )
+        except ValueError:
+            return False
+        return True

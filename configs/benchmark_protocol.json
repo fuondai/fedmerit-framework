@@ -1,0 +1,64 @@
+{
+  "schema_version": "fedmerit/certificate-calculation/v3",
+  "analysis_unit": "device-session or machine-cycle source group",
+  "model": {
+    "family": "linear_logistic",
+    "activation": "sigmoid_decimal80",
+    "output": "binary",
+    "loss_quantum": 1e-12
+  },
+  "evaluation_policy": {
+    "policy_id": "brier-decimal80-v1",
+    "loss": "brier",
+    "preprocessing": "artifact-affine-standardization-v1",
+    "decimal_precision": 80,
+    "rounding": "round-half-even",
+    "group_loss_quantum": "0.000000000001",
+    "group_order": "ascending-group-id",
+    "missing_value_rule": "reject",
+    "class_weights": [1.0, 1.0],
+    "group_reduction": "class-weighted-row-mean-then-clip-[0,1]"
+  },
+  "sampling_frame_policy": {
+    "descriptor": "sealed-opaque-catalog-v1",
+    "frame_authority_signature": "Ed25519",
+    "beacon_authentication": "Ed25519",
+    "beacon_head": "durable-signed-monotonic-immediate-parent-v1",
+    "watcher_completeness_required": true,
+    "selection": "beacon-sha256-rejection-sampling-v1",
+    "catalog_leaf": "opaque-id-plus-nonce-hiding-payload-commitment",
+    "catalog_root": "sha256-merkle-v1",
+    "opening_nonce_bits": 256,
+    "catalog_signed_before_candidate_fixation": true,
+    "eligible_set_bound_in_candidate": true,
+    "opening_verified_before_scoring": true,
+    "fixation_order": "signed-catalog-and-authenticated-beacon-parent-before-durable-candidate-before-future-beacon"
+  },
+  "certificate_evaluation": {
+    "risk_interval_precision_bits": 192,
+    "risk_grid": [
+      {"alpha": 0.1, "epsilon": 0.35, "gamma": 0.0},
+      {"alpha": 0.05, "epsilon": 0.25, "gamma": 0.05},
+      {"alpha": 0.01, "epsilon": 0.25, "gamma": 0.05},
+      {"alpha": 0.001, "epsilon": 0.25, "gamma": 0.05},
+      {"alpha": 0.01, "epsilon": 0.15, "gamma": 0.05},
+      {"alpha": 0.01, "epsilon": 0.1, "gamma": 0.05},
+      {"alpha": 0.0005, "epsilon": 0.25, "gamma": 0.05}
+    ],
+    "quorum_fault_counts": [0, 1, 2, 3, 4, 5, 6, 7, 8]
+  },
+  "certified_schedule_example": {
+    "schedule_id": "uniform-100-delta-0.05-v1",
+    "finite_horizon": 100,
+    "allocation_per_index": {
+      "alpha": 0.0005,
+      "epsilon": 0.25,
+      "gamma": 0.05,
+      "group_count": 169
+    }
+  },
+  "source_partition_policy": {
+    "proposal_and_commit_sources": "distinct registered source manifests",
+    "commit_probe": "payload-opened only after beacon selection and permanently retired after release"
+  }
+}
