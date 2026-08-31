@@ -43,6 +43,25 @@ metrics, a known-answer receipt, and a SHA-256 manifest. It rejects a receipt
 that differs from `artifacts/reference_receipt.json`. Generated result
 directories are not part of the source distribution.
 
+## Paper chart
+
+Install the plotting dependencies, produce the deterministic evidence, and
+render the protocol-scaling chart:
+
+```bash
+python3 -m pip install -r requirements-figures.txt
+python3 scripts/produce_evidence.py --output results_devready
+python3 figures/plot_protocol_scaling.py \
+  --evidence results_devready/metrics.json
+```
+
+The renderer checks the three plotted risk rows with the implementation's exact
+`required_groups` routine, checks every certificate size against the wire-format
+formula, and then cross-checks both slices against `metrics.json`. It writes the
+paper-ready vector file to `figures/fig_protocol_scaling.pdf`. Use
+`--no-evidence-check` only to reproduce the checked-in CSV without a generated
+evidence directory; the implementation-level checks still run.
+
 ## Scope
 
 Public receipt verification checks state, catalog, beacon, risk, and quorum

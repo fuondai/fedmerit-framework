@@ -41,6 +41,7 @@ from fedmerit.model import (
     SamplingFrame,
     SourcePartition,
     StateContext,
+    WitnessSignature,
     ZERO_HASH,
 )
 from scripts.produce_evidence import _execute, _handover_rows, _protocol_case
@@ -48,6 +49,33 @@ from scripts.produce_evidence import _execute, _handover_rows, _protocol_case
 
 def _digest(label: str) -> str:
     return hashlib.sha256(label.encode("ascii")).hexdigest()
+
+
+class ReceiptEncodingTests(unittest.TestCase):
+    def test_certificate_byte_grid_matches_wire_encoder(self) -> None:
+        core = ReceiptCore(
+            *(_digest(f"receipt-field-{index}") for index in range(10)),
+            1,
+            0.25,
+            0.05,
+            0.01,
+            -0.10,
+            "commit",
+        )
+        for faults in range(9):
+            witness_count = 3 * faults + 1
+            signatures = tuple(
+                WitnessSignature(index, bytes([index]) * 64)
+                for index in range(2 * faults + 1)
+            )
+            receipt = Receipt(core, witness_count, signatures)
+            expected = 357 + (witness_count + 7) // 8 + 64 * (2 * faults + 1)
+            encoded = receipt.to_bytes()
+            self.assertEqual(len(encoded), expected)
+            self.assertEqual(
+                Receipt.from_bytes(encoded, witness_count=witness_count).to_bytes(),
+                encoded,
+            )
 
 
 class SealedCatalogConformanceTests(unittest.TestCase):

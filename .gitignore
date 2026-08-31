@@ -12,3 +12,4 @@ venv/
 output/
 results*/
 .DS_Store
+figures/*_preview.png

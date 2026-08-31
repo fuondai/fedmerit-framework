@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import sqlite3
 from dataclasses import replace
 from fractions import Fraction
@@ -154,7 +153,7 @@ def _quorum_rows() -> list[dict[str, Any]]:
     for f in QUORUM_FAULT_COUNTS:
         witnesses = 3 * f + 1
         signatures = 2 * f + 1
-        bitmap_bytes = math.ceil(witnesses / 8)
+        bitmap_bytes = (witnesses + 7) // 8
         encoded_bytes = RECEIPT_CORE_BYTES + bitmap_bytes + 64 * signatures
         rows.append(
             {

@@ -1,0 +1,2 @@
+matplotlib==3.10.8
+SciencePlots==2.2.1

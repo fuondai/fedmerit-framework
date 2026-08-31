@@ -1,0 +1,13 @@
+panel,epsilon,gamma,alpha,required_groups,f,certificate_bytes
+risk,0.10,0.05,0.01,410,,
+risk,0.15,0.05,0.01,231,,
+risk,0.25,0.05,0.01,103,,
+quorum,,,,,0,422
+quorum,,,,,1,550
+quorum,,,,,2,678
+quorum,,,,,3,807
+quorum,,,,,4,935
+quorum,,,,,5,1063
+quorum,,,,,6,1192
+quorum,,,,,7,1320
+quorum,,,,,8,1449
