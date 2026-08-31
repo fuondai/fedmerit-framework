@@ -86,6 +86,9 @@ class SealedCatalogConformanceTests(unittest.TestCase):
     def test_complete_flow_passes(self) -> None:
         self.assertEqual(self.result["status"], "passed")
 
+    def test_cross_handover_risk_budget_is_registered(self) -> None:
+        self.assertTrue(self.result["cross_handover_risk_budget_registered"])
+
     def test_catalog_reassignment_is_rejected(self) -> None:
         self.assertTrue(self.result["catalog_reassignment_rejected"])
 
@@ -124,7 +127,7 @@ class SealedCatalogConformanceTests(unittest.TestCase):
     def test_final_issuance_step_rechecks_the_live_head(self) -> None:
         self.assertTrue(self.result["final_issuance_fence_rejected"])
 
-    def test_commitment_is_keyed_by_the_secret_opening(self) -> None:
+    def test_commitment_is_salted_by_the_secret_opening(self) -> None:
         group = ProbeGroup(
             "group-0",
             _digest("source-manifest"),
@@ -163,6 +166,15 @@ class SealedCatalogConformanceTests(unittest.TestCase):
 
             self.assertNotIn(selected_probe.probe_id.encode("ascii"), public_bytes)
             self.assertNotIn(selected_probe.sealing_nonce.hex().encode("ascii"), public_bytes)
+            self.assertNotIn(
+                selected_probe.collection_window_start.encode("ascii"), public_bytes
+            )
+            self.assertNotIn(
+                selected_probe.collection_window_end.encode("ascii"), public_bytes
+            )
+            self.assertNotIn(
+                selected_probe.source_handle_hash.encode("ascii"), public_bytes
+            )
             for group in selected_probe.groups:
                 self.assertNotIn(group.group_id.encode("ascii"), public_bytes)
                 self.assertNotIn(
@@ -246,6 +258,97 @@ class RiskScheduleRegistryTests(unittest.TestCase):
                     case["schedule"],
                     0,
                     fixation_hash=_digest("competing-fixation"),
+                )
+
+
+class LineageRiskBudgetTests(unittest.TestCase):
+    def test_context_schedules_share_one_budget_across_handovers(self) -> None:
+        with TemporaryDirectory(prefix="fedmerit-lineage-risk-") as directory:
+            path = Path(directory) / "audit.sqlite3"
+            policy = EvaluationPolicy("brier-decimal80-v1")
+            model = LinearModelArtifact((0.0, 0.0))
+            context = StateContext(
+                "twin-lineage",
+                "domain-0",
+                0,
+                _digest("lineage-schema-0"),
+                policy.policy_hash,
+                0,
+                _digest("lineage-authority-0"),
+            )
+            registry = AuditRegistry(
+                path,
+                genesis_model_hash=model.artifact_hash,
+                initial_context=context,
+                evaluation_policy=policy,
+            )
+            registry.provision_lineage_risk_budget(0.25)
+            registry.register_risk_schedule(
+                RiskSchedule(
+                    "lineage-schedule-0",
+                    context.context_hash,
+                    ZERO_HASH,
+                    0.125,
+                    (RiskAllocation(0.25, 0.05, 0.125, 1),),
+                )
+            )
+
+            successor = StateContext(
+                context.twin_id,
+                "domain-1",
+                1,
+                _digest("lineage-schema-1"),
+                policy.policy_hash,
+                0,
+                _digest("lineage-authority-1"),
+            )
+            registry.handover(
+                state_context=successor, evaluation_policy=policy
+            )
+            registry.register_risk_schedule(
+                RiskSchedule(
+                    "lineage-schedule-1",
+                    successor.context_hash,
+                    ZERO_HASH,
+                    0.0625,
+                    (RiskAllocation(0.25, 0.05, 0.0625, 1),),
+                )
+            )
+
+            reopened = AuditRegistry(
+                path,
+                genesis_model_hash=model.artifact_hash,
+                initial_context=successor,
+                evaluation_policy=policy,
+            )
+            self.assertEqual(
+                reopened.lineage_risk_budget,
+                (context.twin_id, ZERO_HASH, 0.25),
+            )
+            with self.assertRaisesRegex(ValueError, "already frozen"):
+                reopened.provision_lineage_risk_budget(0.5)
+
+            second_successor = StateContext(
+                context.twin_id,
+                "domain-2",
+                2,
+                _digest("lineage-schema-2"),
+                policy.policy_hash,
+                0,
+                _digest("lineage-authority-2"),
+            )
+            reopened.handover(
+                state_context=second_successor, evaluation_policy=policy
+            )
+            with self.assertRaisesRegex(ValueError, "cross-handover"):
+                reopened.register_risk_schedule(
+                    RiskSchedule(
+                        "lineage-schedule-2",
+                        second_successor.context_hash,
+                        ZERO_HASH,
+                        0.125,
+                        (RiskAllocation(0.25, 0.05, 0.125, 1),),
+                    )
                 )
 
 

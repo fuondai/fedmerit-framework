@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import math
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Sequence
 
@@ -614,6 +616,12 @@ class AuditRegistry:
                     lifetime_delta REAL NOT NULL,
                     schedule_blob BLOB NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS lineage_risk_budget(
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    twin_id TEXT UNIQUE NOT NULL,
+                    anchor_receipt_hash TEXT NOT NULL,
+                    lifetime_delta REAL NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS spent_risk_allocations(
                     schedule_hash TEXT NOT NULL,
                     allocation_index INTEGER NOT NULL,
@@ -846,6 +854,57 @@ class AuditRegistry:
             ).fetchone()
         return row is not None and bytes(row[0]) == canonical_bytes(policy)
 
+    def provision_lineage_risk_budget(self, lifetime_delta: float) -> None:
+        """Freeze one risk envelope that survives context handovers.
+
+        The envelope belongs to the invariant twin identity rather than a domain
+        context.  Context-specific schedules may rotate after handover, but their
+        declared lifetime budgets must fit jointly inside this envelope.
+        """
+
+        if isinstance(lifetime_delta, bool) or not isinstance(
+            lifetime_delta, (int, float)
+        ):
+            raise ValueError("lineage lifetime budget must be a binary64 scalar")
+        lifetime_delta = float(lifetime_delta)
+        if not math.isfinite(lifetime_delta) or not 0 < lifetime_delta < 1:
+            raise ValueError("lineage lifetime budget must lie in (0,1)")
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            twin_id = str(
+                db.execute("SELECT twin_id FROM context_head WHERE id=1").fetchone()[0]
+            )
+            head = str(db.execute("SELECT head FROM audit_state WHERE id=1").fetchone()[0])
+            prior = db.execute(
+                "SELECT twin_id, anchor_receipt_hash, lifetime_delta "
+                "FROM lineage_risk_budget WHERE id=1"
+            ).fetchone()
+            expected = (twin_id, head, lifetime_delta)
+            if prior is not None:
+                if (str(prior[0]), str(prior[1]), float(prior[2])) != expected:
+                    db.rollback()
+                    raise ValueError("lineage risk budget is already frozen")
+                db.commit()
+                return
+            if db.execute("SELECT 1 FROM risk_schedules LIMIT 1").fetchone() is not None:
+                db.rollback()
+                raise ValueError("lineage risk budget must precede every schedule")
+            db.execute(
+                "INSERT INTO lineage_risk_budget VALUES(1,?,?,?)", expected
+            )
+            db.commit()
+
+    @property
+    def lineage_risk_budget(self) -> tuple[str, str, float] | None:
+        with closing(self._connect()) as db:
+            row = db.execute(
+                "SELECT twin_id, anchor_receipt_hash, lifetime_delta "
+                "FROM lineage_risk_budget WHERE id=1"
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row[0]), str(row[1]), float(row[2])
+
     @staticmethod
     def _require_risk_schedule_locked(
         db: sqlite3.Connection, schedule: RiskSchedule
@@ -908,6 +967,33 @@ class AuditRegistry:
                 raise ValueError(
                     "risk schedule is not anchored to the authenticated audit head"
                 )
+            lineage = db.execute(
+                "SELECT twin_id, lifetime_delta FROM lineage_risk_budget WHERE id=1"
+            ).fetchone()
+            if lineage is not None:
+                live_twin = str(
+                    db.execute(
+                        "SELECT twin_id FROM context_head WHERE id=1"
+                    ).fetchone()[0]
+                )
+                if str(lineage[0]) != live_twin:
+                    db.rollback()
+                    raise ValueError("lineage risk budget belongs to another twin")
+                allocated = sum(
+                    (
+                        Fraction.from_float(float(row[0]))
+                        for row in db.execute(
+                            "SELECT lifetime_delta FROM risk_schedules"
+                        ).fetchall()
+                    ),
+                    Fraction(),
+                )
+                proposed = allocated + Fraction.from_float(schedule.lifetime_delta)
+                if proposed > Fraction.from_float(float(lineage[1])):
+                    db.rollback()
+                    raise ValueError(
+                        "context schedule exceeds the cross-handover lineage budget"
+                    )
             try:
                 db.execute(
                     "INSERT INTO risk_schedules VALUES(?,?,?,?,?)",

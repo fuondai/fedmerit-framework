@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import hmac
 import math
 import secrets
 import struct
@@ -343,15 +342,17 @@ class SourcePartition:
 
 @dataclass(frozen=True)
 class SamplingFrameEntry:
-    """Public leaf binding one opaque identifier to sealed probe content."""
+    """Public leaf binding an opaque identifier to sealed probe content.
+
+    Collection windows and source handles remain inside the salted payload
+    commitment.  Exposing them per leaf would let a proposer condition a
+    candidate on catalog metadata even when the raw groups remain sealed.
+    """
 
     probe_id_hash: str
     context_hash: str
     policy_hash: str
     group_count: int
-    collection_window_start: str
-    collection_window_end: str
-    source_handle_hash: str
     payload_commitment: str
 
     def __post_init__(self) -> None:
@@ -359,17 +360,12 @@ class SamplingFrameEntry:
             "probe_id_hash",
             "context_hash",
             "policy_hash",
-            "source_handle_hash",
             "payload_commitment",
         ):
             _sha256(name, getattr(self, name))
         _uint32("group_count", self.group_count)
         if self.group_count == 0:
             raise ValueError("sampling-frame entries must contain at least one group")
-        _required("collection_window_start", self.collection_window_start)
-        _required("collection_window_end", self.collection_window_end)
-        if self.collection_window_start >= self.collection_window_end:
-            raise ValueError("sampling-frame collection window must be increasing")
 
 
 @dataclass(frozen=True)
@@ -411,6 +407,8 @@ class SamplingFrame:
             for entry in entries
         ):
             raise ValueError("sampling-frame entries must share context and policy")
+        if len({entry.group_count for entry in entries}) != 1:
+            raise ValueError("sampling-frame entries must share one public group count")
         if exclusions != tuple(sorted(exclusions)) or len(exclusions) != len(
             set(exclusions)
         ):
@@ -422,7 +420,7 @@ class SamplingFrame:
     def catalog_root(self) -> str:
         return merkle_root(
             [
-                {"domain": "fedmerit-sealed-catalog-leaf-v1", "entry": entry}
+                {"domain": "fedmerit-sealed-catalog-leaf-v2", "entry": entry}
                 for entry in self.entries
             ]
         )
@@ -431,7 +429,7 @@ class SamplingFrame:
     def frame_hash(self) -> str:
         return digest(
             {
-                "domain": "fedmerit-sealed-catalog-frame-v2",
+                "domain": "fedmerit-sealed-catalog-frame-v3",
                 "catalog_root": self.catalog_root,
                 "frame": self,
             }
@@ -634,7 +632,7 @@ class Candidate:
 
 @dataclass(frozen=True)
 class CommitProbe:
-    """Sealed raw grouped probe with a 256-bit HMAC opening key."""
+    """Raw grouped probe opened by a 256-bit salt after beacon selection."""
 
     probe_id: str
     context_hash: str
@@ -675,7 +673,8 @@ class CommitProbe:
     def commitment(self) -> str:
         payload = canonical_bytes(
             {
-                "domain": "fedmerit-probe-payload-commitment-v2",
+                "domain": "fedmerit-probe-payload-commitment-v3",
+                "sealing_nonce": self.sealing_nonce,
                 "probe_id_hash": self.probe_id_hash,
                 "payload": {
                     "probe_id": self.probe_id,
@@ -688,17 +687,18 @@ class CommitProbe:
                 },
             }
         )
-        return hmac.new(self.sealing_nonce, payload, hashlib.sha256).hexdigest()
+        return hashlib.sha256(payload).hexdigest()
 
     @property
     def probe_id_hash(self) -> str:
         payload = canonical_bytes(
             {
-                "domain": "fedmerit-opaque-probe-id-v2",
+                "domain": "fedmerit-opaque-probe-id-v3",
+                "sealing_nonce": self.sealing_nonce,
                 "probe_id": self.probe_id,
             }
         )
-        return hmac.new(self.sealing_nonce, payload, hashlib.sha256).hexdigest()
+        return hashlib.sha256(payload).hexdigest()
 
     @property
     def frame_entry(self) -> SamplingFrameEntry:
@@ -707,9 +707,6 @@ class CommitProbe:
             self.context_hash,
             self.probe_policy_hash,
             len(self.groups),
-            self.collection_window_start,
-            self.collection_window_end,
-            self.source_handle_hash,
             self.commitment,
         )
 

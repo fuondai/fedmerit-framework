@@ -1,9 +1,14 @@
 # FedMERIT reference implementation
 
-This repository implements the FedMERIT state-scoped certificate protocol:
+This repository implements the FedMERIT lineage-bounded certificate protocol:
 canonical serialization, a finite risk ledger, sealed probe selection, Ed25519
 quorum issuance, one-use release, receipt verification, and an atomic
 `CheckAppend` boundary backed by SQLite.
+
+Catalog entries expose only opaque salted SHA-256 identifiers and payload
+commitments. The selected `ProbeRelease` reveals the 256-bit salt and raw opening
+only to authorized replayers; the public release never carries collection-window,
+source-handle, row, or salt metadata.
 
 ## Environment
 
@@ -74,3 +79,10 @@ version by one, and may change domain, schema, authority, or evaluation policy
 while retaining the installed model version. The registry rejects rollback,
 skipped epochs, and successors whose model version differs from the installed
 artifact.
+
+For deployments that need a probability bound across handovers,
+`AuditRegistry.provision_lineage_risk_budget()` freezes one envelope for the
+invariant twin identity before any context schedule is registered. Every later
+context schedule is charged against the same exact binary64 budget, so a domain
+handover cannot reset the available risk. Without this explicit envelope, the
+implementation intentionally makes only the per-context schedule claim.

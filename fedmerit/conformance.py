@@ -158,6 +158,7 @@ def run() -> dict[str, object]:
             initial_context=context,
             evaluation_policy=policy,
         )
+        registry.provision_lineage_risk_budget(0.9999)
         ledger = RiskLedger(root / "risk.sqlite3")
         ledger.register(schedule, audit_registry=registry)
         ledger.observe_beacon_head(
@@ -580,6 +581,11 @@ def run() -> dict[str, object]:
         score_commitment_separated = (
             release.commit_probe_commitment != candidate.score_probe_commitment
         )
+        lineage_budget_registered = registry.lineage_risk_budget == (
+            context.twin_id,
+            ZERO_HASH,
+            0.9999,
+        )
         passed = (
             fresh_append
             and receipt.core.decision == "reject"
@@ -594,6 +600,7 @@ def run() -> dict[str, object]:
             and issued_receipt_append_blocked_after_handover
             and final_issuance_fence_rejected
             and registry.evaluation_policy_registered(policy)
+            and lineage_budget_registered
             and release.signed_sampling_frame == signed_frame
             and release.signed_beacon_round == signed_beacon_round
             and ledger.fixation_precedes_beacon(candidate)
@@ -614,6 +621,7 @@ def run() -> dict[str, object]:
         "status": "passed" if passed else "failed",
         "explicit_context_provisioned": True,
         "evaluation_policy_registered": True,
+        "cross_handover_risk_budget_registered": lineage_budget_registered,
         "signed_sampling_frame_verified": True,
         "post_fixation_beacon_verified": True,
         "auditable_draw_counter": release.draw_counter,
