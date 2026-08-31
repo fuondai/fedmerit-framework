@@ -32,9 +32,6 @@ python3 -m fedmerit.conformance
 The conformance command exits nonzero if any catalog, beacon, release, replay,
 handover, quorum, or receipt check fails.
 
-The short Vietnamese handoff is in `HUONG_DAN_TIEP_QUAN.md`; the paper-specific
-brief is in `RIVF2026_PAPER_HANDOFF.md`.
-
 ## Evidence producer
 
 ```bash
