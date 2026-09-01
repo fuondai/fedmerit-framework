@@ -11,5 +11,9 @@ venv/
 *.tmp
 output/
 results*/
+!results/
+!results/ur3/
+!results/ur3/*.csv
+!results/ur3/*.json
 .DS_Store
 figures/*_preview.png

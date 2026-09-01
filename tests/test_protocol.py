@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from fedmerit.canonical import canonical_bytes
-from fedmerit.certificate import AuditRegistry, CertificateAuthority
+from fedmerit.certificate import AuditRegistry, CertificateAuthority, Witness
 from fedmerit.conformance import run
 from fedmerit.gate import (
     CommitProbeStore,
@@ -31,6 +31,7 @@ from fedmerit.model import (
     BeaconRound,
     Candidate,
     CommitProbe,
+    ContributorLeaf,
     EvaluationPolicy,
     LinearModelArtifact,
     ProbeGroup,
@@ -39,10 +40,12 @@ from fedmerit.model import (
     RiskAllocation,
     RiskSchedule,
     SamplingFrame,
+    SecurityProfile,
     SourcePartition,
     StateContext,
     WitnessSignature,
     ZERO_HASH,
+    contributor_merkle_root,
 )
 from scripts.produce_evidence import _execute, _handover_rows, _protocol_case
 
@@ -52,6 +55,19 @@ def _digest(label: str) -> str:
 
 
 class ReceiptEncodingTests(unittest.TestCase):
+    def test_contributor_root_binds_identity_update_and_weight(self) -> None:
+        leaves = (
+            ContributorLeaf("client-a", _digest("update-a"), 0.25),
+            ContributorLeaf("client-b", _digest("update-b"), 0.75),
+        )
+        root = contributor_merkle_root(leaves)
+        self.assertNotEqual(
+            root,
+            contributor_merkle_root(
+                (leaves[0], replace(leaves[1], weight=0.5))
+            ),
+        )
+
     def test_certificate_byte_grid_matches_wire_encoder(self) -> None:
         core = ReceiptCore(
             *(_digest(f"receipt-field-{index}") for index in range(10)),
@@ -263,8 +279,9 @@ class SealedCatalogConformanceTests(unittest.TestCase):
 
     def test_one_successor_round_cannot_fund_two_fixations(self) -> None:
         with TemporaryDirectory(prefix="fedmerit-beacon-reservation-") as directory:
+            root = Path(directory)
             case = _protocol_case(
-                Path(directory),
+                root,
                 name="exclusive-beacon-successor",
                 after_bias=2.0,
                 epsilon=0.10,
@@ -300,9 +317,107 @@ class SealedCatalogConformanceTests(unittest.TestCase):
                         ),
                     )
 
+            # A second local risk ledger cannot bypass the authoritative
+            # reservation by presenting another fixation for the same round.
+            second_ledger = RiskLedger(root / "second-risk.sqlite3")
+            second_ledger.register(
+                case["schedule"], audit_registry=case["registry"]
+            )
+            second_ledger.observe_beacon_head(
+                case["signed_beacon_head"],
+                audit_registry=case["registry"],
+                beacon_public_key=case["beacon_private_key"].public_key(),
+                signed_frame=case["signed_frame"],
+                frame_public_key=case["frame_private_key"].public_key(),
+            )
+            conflicting = replace(
+                case["candidate"],
+                after_model=LinearModelArtifact((0.0, 3.0)),
+            )
+            with self.assertRaisesRegex(
+                ValueError, "already reserved by another fixation"
+            ):
+                second_ledger.consume(
+                    conflicting,
+                    case["schedule"],
+                    audit_registry=case["registry"],
+                    beacon_public_key=case["beacon_private_key"].public_key(),
+                    signed_frame=case["signed_frame"],
+                    frame_public_key=case["frame_private_key"].public_key(),
+                )
+
+    def test_post_reveal_fixation_fails_at_the_authoritative_head(self) -> None:
+        with TemporaryDirectory(prefix="fedmerit-beacon-checkpoint-") as directory:
+            root = Path(directory)
+            case = _protocol_case(
+                root,
+                name="checkpoint-bootstrap",
+                after_bias=2.0,
+                epsilon=0.10,
+                gamma=0.05,
+                alpha=0.10,
+            )
+            fresh = RiskLedger(root / "fresh-risk.sqlite3")
+            fresh.observe_beacon_head(
+                case["signed_beacon_round"],
+                audit_registry=case["registry"],
+                beacon_public_key=case["beacon_private_key"].public_key(),
+                signed_frame=case["signed_frame"],
+                frame_public_key=case["frame_private_key"].public_key(),
+            )
+            with self.assertRaisesRegex(ValueError, "beacon head"):
+                fresh.consume(
+                    case["candidate"],
+                    case["schedule"],
+                    audit_registry=case["registry"],
+                    beacon_public_key=case["beacon_private_key"].public_key(),
+                    signed_frame=case["signed_frame"],
+                    frame_public_key=case["frame_private_key"].public_key(),
+                )
+
     def test_public_and_authorized_paths_are_distinct(self) -> None:
         self.assertTrue(self.result["public_receipt_verified_without_raw_probe"])
         self.assertTrue(self.result["authorized_raw_probe_replay_verified"])
+
+    def test_quorum_skips_one_unavailable_witness(self) -> None:
+        with TemporaryDirectory(prefix="fedmerit-quorum-fallback-") as directory:
+            case = _protocol_case(
+                Path(directory),
+                name="quorum-fallback",
+                after_bias=2.0,
+                epsilon=0.10,
+                gamma=0.05,
+                alpha=0.10,
+            )
+            release = case["store"].release(
+                case["candidate"],
+                signed_beacon_round=case["signed_beacon_round"],
+                beacon_public_key=case["beacon_private_key"].public_key(),
+                schedule=case["schedule"],
+                risk_ledger=case["ledger"],
+                audit_registry=case["registry"],
+            )
+            original = Witness.attest
+
+            def one_unavailable(witness: Witness, *args: object, **kwargs: object):
+                if witness.witness_index == 0:
+                    raise RuntimeError("simulated unavailable witness")
+                return original(witness, *args, **kwargs)  # type: ignore[arg-type]
+
+            with patch.object(Witness, "attest", new=one_unavailable):
+                receipt = case["authority"].issue(
+                    case["candidate"],
+                    release,
+                    store_public_key=case["store"].public_key,
+                    frame_public_key=case["frame_private_key"].public_key(),
+                    schedule=case["schedule"],
+                    risk_ledger=case["ledger"],
+                    audit_registry=case["registry"],
+                )
+            self.assertEqual(
+                tuple(signature.witness_index for signature in receipt.signatures),
+                (1, 2, 3),
+            )
 
     def test_verifier_trust_roots_are_registry_bound(self) -> None:
         self.assertTrue(self.result["rogue_witness_roster_rejected"])
@@ -334,6 +449,18 @@ class SealedCatalogConformanceTests(unittest.TestCase):
         second = CommitProbe(**fields, sealing_nonce=b"b" * 32)
         self.assertNotEqual(first.probe_id_hash, second.probe_id_hash)
         self.assertNotEqual(first.commitment, second.commitment)
+
+    def test_source_partition_rejects_proposal_score_overlap(self) -> None:
+        shared = _digest("shared-source-manifest")
+        with self.assertRaisesRegex(ValueError, "must be disjoint"):
+            SourcePartition(
+                _digest("partition-context"),
+                _digest("partition-contributors"),
+                _digest("partition-score"),
+                _digest("partition-policy"),
+                (shared,),
+                (shared,),
+            )
 
     def test_public_release_excludes_raw_probe_and_opening(self) -> None:
         with TemporaryDirectory(prefix="fedmerit-public-release-") as directory:
@@ -372,6 +499,9 @@ class SealedCatalogConformanceTests(unittest.TestCase):
                 selected_probe.probe_id_hash.encode("ascii"), public_bytes
             )
             self.assertIn(selected_probe.commitment.encode("ascii"), public_bytes)
+            for probe in case["probes"]:
+                if probe != selected_probe:
+                    self.assertNotIn(probe.commitment.encode("ascii"), public_bytes)
 
 
 class SourceManifestLedgerTests(unittest.TestCase):
@@ -404,6 +534,34 @@ class SourceManifestLedgerTests(unittest.TestCase):
 
 
 class RiskScheduleRegistryTests(unittest.TestCase):
+    def test_schedule_registration_requires_lineage_envelope(self) -> None:
+        with TemporaryDirectory(prefix="fedmerit-required-lineage-") as directory:
+            policy = EvaluationPolicy("brier-decimal80-v1")
+            context = StateContext(
+                "required-lineage",
+                "domain-0",
+                0,
+                _digest("required-lineage-schema"),
+                policy.policy_hash,
+                0,
+                _digest("required-lineage-authority"),
+            )
+            registry = AuditRegistry(
+                Path(directory) / "audit.sqlite3",
+                genesis_model=LinearModelArtifact((0.0, 0.0)),
+                initial_context=context,
+                evaluation_policy=policy,
+            )
+            schedule = RiskSchedule(
+                "required-lineage-schedule",
+                context.context_hash,
+                ZERO_HASH,
+                0.10,
+                (RiskAllocation(0.10, 0.05, 0.10, 205),),
+            )
+            with self.assertRaisesRegex(ValueError, "must be provisioned"):
+                registry.register_risk_schedule(schedule)
+
     def test_fresh_ledger_cannot_reset_same_context_lifetime_budget(self) -> None:
         with TemporaryDirectory(prefix="fedmerit-schedule-reset-") as directory:
             root = Path(directory)
@@ -537,6 +695,90 @@ class LineageRiskBudgetTests(unittest.TestCase):
                         (RiskAllocation(0.25, 0.05, 0.125, 1),),
                     )
                 )
+
+    def test_attempt_cap_is_cumulative_across_context_handovers(self) -> None:
+        with TemporaryDirectory(prefix="fedmerit-lineage-attempt-cap-") as directory:
+            profile = SecurityProfile(max_attempts=2)
+            policy = EvaluationPolicy(
+                "brier-decimal80-v1", security_profile=profile
+            )
+            model = LinearModelArtifact((0.0, 0.0))
+            contexts = [
+                StateContext(
+                    "twin-attempt-cap",
+                    f"domain-{index}",
+                    index,
+                    _digest(f"attempt-cap-schema-{index}"),
+                    policy.policy_hash,
+                    0,
+                    _digest(f"attempt-cap-authority-{index}"),
+                )
+                for index in range(3)
+            ]
+            registry = AuditRegistry(
+                Path(directory) / "audit.sqlite3",
+                genesis_model=model,
+                initial_context=contexts[0],
+                evaluation_policy=policy,
+            )
+            registry.provision_lineage_risk_budget(0.20)
+            for index in range(2):
+                registry.register_risk_schedule(
+                    RiskSchedule(
+                        f"attempt-cap-schedule-{index}",
+                        contexts[index].context_hash,
+                        ZERO_HASH,
+                        0.05,
+                        (RiskAllocation(0.25, 0.05, 0.05, 67),),
+                    )
+                )
+                registry.handover(
+                    state_context=contexts[index + 1],
+                    evaluation_policy=policy,
+                )
+            with self.assertRaisesRegex(ValueError, "lifetime attempt cap"):
+                registry.register_risk_schedule(
+                    RiskSchedule(
+                        "attempt-cap-schedule-2",
+                        contexts[2].context_hash,
+                        ZERO_HASH,
+                        0.05,
+                        (RiskAllocation(0.25, 0.05, 0.05, 67),),
+                    )
+                )
+
+    def test_protocol_event_journal_is_hash_linked_and_append_only(self) -> None:
+        with TemporaryDirectory(prefix="fedmerit-event-journal-") as directory:
+            case = _protocol_case(
+                Path(directory),
+                name="event-journal",
+                after_bias=2.0,
+                epsilon=0.10,
+                gamma=0.05,
+                alpha=0.10,
+            )
+            _, _, appended = _execute(case)
+            self.assertTrue(appended)
+            events = case["registry"].protocol_events
+            self.assertTrue(case["registry"].protocol_event_chain_valid())
+            self.assertTrue(
+                {
+                    "lineage-budget-provisioned",
+                    "risk-schedule-registered",
+                    "beacon-head-observed",
+                    "beacon-successor-reserved",
+                    "risk-allocation-spent",
+                    "source-manifests-retired",
+                    "receipt-issued",
+                    "receipt-appended",
+                }.issubset({str(event["event_type"]) for event in events})
+            )
+            with sqlite3.connect(case["registry"].path) as db:
+                with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                    db.execute(
+                        "UPDATE protocol_events SET event_type='tampered' "
+                        "WHERE sequence=1"
+                    )
 
 
 class RiskArithmeticTests(unittest.TestCase):
@@ -715,6 +957,9 @@ class WireTypeValidationTests(unittest.TestCase):
             entries,  # type: ignore[arg-type]
             "beacon-immutable",
             _digest("immutable-beacon-key"),
+            (_digest("immutable-partition"),),
+            1,
+            _digest("immutable-beacon-checkpoint"),
             exclusions,  # type: ignore[arg-type]
         )
         before = (probe.commitment, schedule.schedule_hash, frame.frame_hash)
@@ -972,6 +1217,7 @@ class ModelSuccessorTests(unittest.TestCase):
                 case["candidate"].score_probe_commitment,
                 case["policy"].policy_hash,
                 case["candidate"].source_partition.source_manifest_hashes,
+                case["candidate"].source_partition.score_source_manifest_hashes,
             )
             next_candidate = replace(
                 case["candidate"],
@@ -1059,6 +1305,14 @@ class ModelSuccessorTests(unittest.TestCase):
                 _digest("successor-source-handle"),
                 b"c" * 32,
             )
+            partition = SourcePartition(
+                successor.context_hash,
+                _digest("successor-contributors"),
+                _digest("successor-score"),
+                first["policy"].policy_hash,
+                (_digest("successor-proposal-source"),),
+                (_digest("successor-score-source"),),
+            )
             successor_frame = SamplingFrame(
                 "frame-two-commits-successor",
                 successor.context_hash,
@@ -1066,16 +1320,12 @@ class ModelSuccessorTests(unittest.TestCase):
                 (successor_probe.frame_entry,),
                 first["frame"].beacon_id,
                 first["frame"].beacon_public_key_hash,
+                (partition.partition_hash,),
+                beacon_checkpoint_round=first["signed_beacon_round"].round.round_number,
+                beacon_checkpoint_hash=first["signed_beacon_round"].round.round_hash,
             )
             signed_successor_frame = sign_sampling_frame(
                 successor_frame, first["frame_private_key"]
-            )
-            partition = SourcePartition(
-                successor.context_hash,
-                _digest("successor-contributors"),
-                _digest("successor-score"),
-                first["policy"].policy_hash,
-                (_digest("successor-proposal-source"),),
             )
             allocation = RiskAllocation(0.10, 0.05, 0.10, group_count)
             schedule = RiskSchedule(
@@ -1088,6 +1338,7 @@ class ModelSuccessorTests(unittest.TestCase):
             ledger = first["ledger"]
             ledger.observe_beacon_head(
                 first["signed_beacon_round"],
+                audit_registry=first["registry"],
                 beacon_public_key=first["beacon_private_key"].public_key(),
                 signed_frame=first["signed_frame"],
                 frame_public_key=first["frame_private_key"].public_key(),
@@ -1126,6 +1377,7 @@ class ModelSuccessorTests(unittest.TestCase):
             ledger.consume(
                 candidate,
                 schedule,
+                audit_registry=first["registry"],
                 beacon_public_key=first["beacon_private_key"].public_key(),
                 signed_frame=signed_successor_frame,
                 frame_public_key=first["frame_private_key"].public_key(),
@@ -1240,6 +1492,14 @@ class ModelSuccessorTests(unittest.TestCase):
                 _digest("fresh-ledger-successor-handle"),
                 b"d" * 32,
             )
+            partition = SourcePartition(
+                successor.context_hash,
+                _digest("fresh-ledger-successor-contributors"),
+                _digest("fresh-ledger-successor-score"),
+                first["policy"].policy_hash,
+                (_digest("fresh-ledger-successor-proposal"),),
+                (_digest("fresh-ledger-successor-score-source"),),
+            )
             successor_frame = SamplingFrame(
                 "fresh-ledger-successor-frame",
                 successor.context_hash,
@@ -1247,16 +1507,12 @@ class ModelSuccessorTests(unittest.TestCase):
                 (successor_probe.frame_entry,),
                 first["frame"].beacon_id,
                 first["frame"].beacon_public_key_hash,
+                (partition.partition_hash,),
+                beacon_checkpoint_round=first["signed_beacon_round"].round.round_number,
+                beacon_checkpoint_hash=first["signed_beacon_round"].round.round_hash,
             )
             signed_successor_frame = sign_sampling_frame(
                 successor_frame, first["frame_private_key"]
-            )
-            partition = SourcePartition(
-                successor.context_hash,
-                _digest("fresh-ledger-successor-contributors"),
-                _digest("fresh-ledger-successor-score"),
-                first["policy"].policy_hash,
-                (_digest("fresh-ledger-successor-proposal"),),
             )
             allocation = RiskAllocation(0.10, 0.05, 0.10, group_count)
             schedule = RiskSchedule(
@@ -1272,8 +1528,9 @@ class ModelSuccessorTests(unittest.TestCase):
             ledger = RiskLedger(root / "fresh-risk.sqlite3")
             ledger.observe_beacon_head(
                 first["signed_beacon_round"],
+                audit_registry=first["registry"],
                 beacon_public_key=first["beacon_private_key"].public_key(),
-                signed_frame=first["signed_frame"],
+                signed_frame=signed_successor_frame,
                 frame_public_key=first["frame_private_key"].public_key(),
             )
             ledger.register(schedule, audit_registry=first["registry"])
@@ -1311,6 +1568,7 @@ class ModelSuccessorTests(unittest.TestCase):
             ledger.consume(
                 candidate,
                 schedule,
+                audit_registry=first["registry"],
                 beacon_public_key=first["beacon_private_key"].public_key(),
                 signed_frame=signed_successor_frame,
                 frame_public_key=first["frame_private_key"].public_key(),
@@ -1398,6 +1656,14 @@ class ModelSuccessorTests(unittest.TestCase):
                 _digest("release-handover-source-handle"),
                 b"h" * 32,
             )
+            partition = SourcePartition(
+                successor.context_hash,
+                _digest("release-handover-contributors"),
+                _digest("release-handover-score"),
+                first["policy"].policy_hash,
+                (_digest("release-handover-proposal"),),
+                (_digest("release-handover-score-source"),),
+            )
             successor_frame = SamplingFrame(
                 "release-handover-successor-frame",
                 successor.context_hash,
@@ -1405,16 +1671,12 @@ class ModelSuccessorTests(unittest.TestCase):
                 (successor_probe.frame_entry,),
                 first["frame"].beacon_id,
                 first["frame"].beacon_public_key_hash,
+                (partition.partition_hash,),
+                beacon_checkpoint_round=first["signed_beacon_round"].round.round_number,
+                beacon_checkpoint_hash=first["signed_beacon_round"].round.round_hash,
             )
             signed_successor_frame = sign_sampling_frame(
                 successor_frame, first["frame_private_key"]
-            )
-            partition = SourcePartition(
-                successor.context_hash,
-                _digest("release-handover-contributors"),
-                _digest("release-handover-score"),
-                first["policy"].policy_hash,
-                (_digest("release-handover-proposal"),),
             )
             allocation = RiskAllocation(0.10, 0.05, 0.10, group_count)
             schedule = RiskSchedule(
@@ -1428,6 +1690,7 @@ class ModelSuccessorTests(unittest.TestCase):
             ledger.register(schedule, audit_registry=first["registry"])
             ledger.observe_beacon_head(
                 first["signed_beacon_round"],
+                audit_registry=first["registry"],
                 beacon_public_key=first["beacon_private_key"].public_key(),
                 signed_frame=signed_successor_frame,
                 frame_public_key=first["frame_private_key"].public_key(),
@@ -1466,6 +1729,7 @@ class ModelSuccessorTests(unittest.TestCase):
             ledger.consume(
                 candidate,
                 schedule,
+                audit_registry=first["registry"],
                 beacon_public_key=first["beacon_private_key"].public_key(),
                 signed_frame=signed_successor_frame,
                 frame_public_key=first["frame_private_key"].public_key(),

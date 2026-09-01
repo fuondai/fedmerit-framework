@@ -32,6 +32,7 @@ from .model import (
     BeaconRound,
     Candidate,
     CommitProbe,
+    ContributorLeaf,
     EvaluationPolicy,
     LinearModelArtifact,
     ProbeGroup,
@@ -42,6 +43,7 @@ from .model import (
     SourcePartition,
     StateContext,
     ZERO_HASH,
+    contributor_merkle_root,
 )
 
 
@@ -112,6 +114,30 @@ def run() -> dict[str, object]:
         beacon_public_key_bytes = beacon_private_key.public_key().public_bytes(
             serialization.Encoding.Raw, serialization.PublicFormat.Raw
         )
+        signed_beacon_head = sign_beacon_round(
+            BeaconRound(
+                "reference-beacon",
+                40,
+                _digest("beacon-round-39"),
+                hashlib.sha256(b"registered-conformance-beacon-round-40").digest(),
+            ),
+            beacon_private_key,
+        )
+        contributor_root = contributor_merkle_root(
+            (
+                ContributorLeaf("client-0", _digest("update-0"), 0.5),
+                ContributorLeaf("client-1", _digest("update-1"), 0.5),
+            )
+        )
+        score_commitment = _digest("score-probe-0")
+        partition = SourcePartition(
+            context.context_hash,
+            contributor_root,
+            score_commitment,
+            policy.policy_hash,
+            (_digest("proposal-source-0"),),
+            (_digest("score-source-0"),),
+        )
         frame = SamplingFrame(
             "frame-0",
             context.context_hash,
@@ -124,17 +150,11 @@ def run() -> dict[str, object]:
             ),
             "reference-beacon",
             hashlib.sha256(beacon_public_key_bytes).hexdigest(),
+            (partition.partition_hash,),
+            beacon_checkpoint_round=signed_beacon_head.round.round_number,
+            beacon_checkpoint_hash=signed_beacon_head.round.round_hash,
         )
         signed_frame = sign_sampling_frame(frame, frame_private_key)
-        contributor_root = _digest("contributors-0")
-        score_commitment = _digest("score-probe-0")
-        partition = SourcePartition(
-            context.context_hash,
-            contributor_root,
-            score_commitment,
-            policy.policy_hash,
-            (_digest("proposal-source-0"),),
-        )
         allocation = RiskAllocation(0.1, 0.0, 0.999, 1)
         schedule = RiskSchedule(
             "schedule-0",
@@ -142,15 +162,6 @@ def run() -> dict[str, object]:
             ZERO_HASH,
             0.9999,
             (allocation,),
-        )
-        signed_beacon_head = sign_beacon_round(
-            BeaconRound(
-                "reference-beacon",
-                40,
-                _digest("beacon-round-39"),
-                hashlib.sha256(b"registered-conformance-beacon-round-40").digest(),
-            ),
-            beacon_private_key,
         )
         candidate = Candidate(
             context.context_hash,
@@ -182,6 +193,7 @@ def run() -> dict[str, object]:
         ledger.register(schedule, audit_registry=registry)
         ledger.observe_beacon_head(
             signed_beacon_head,
+            audit_registry=registry,
             beacon_public_key=beacon_private_key.public_key(),
             signed_frame=signed_frame,
             frame_public_key=frame_private_key.public_key(),
@@ -200,6 +212,7 @@ def run() -> dict[str, object]:
                     ),
                     beacon_private_key,
                 ),
+                audit_registry=registry,
                 beacon_public_key=beacon_private_key.public_key(),
                 signed_frame=signed_frame,
                 frame_public_key=frame_private_key.public_key(),
@@ -209,6 +222,7 @@ def run() -> dict[str, object]:
         ledger.consume(
             candidate,
             schedule,
+            audit_registry=registry,
             beacon_public_key=beacon_private_key.public_key(),
             signed_frame=signed_frame,
             frame_public_key=frame_private_key.public_key(),
@@ -330,17 +344,19 @@ def run() -> dict[str, object]:
         )
         late_ledger = RiskLedger(root / "late-risk.sqlite3")
         late_ledger.register(schedule, audit_registry=registry)
-        late_ledger.observe_beacon_head(
-            signed_beacon_round,
-            beacon_public_key=beacon_private_key.public_key(),
-            signed_frame=signed_frame,
-            frame_public_key=frame_private_key.public_key(),
-        )
         future_round_as_fixation_head_rejected = False
         try:
+            late_ledger.observe_beacon_head(
+                signed_beacon_round,
+                audit_registry=registry,
+                beacon_public_key=beacon_private_key.public_key(),
+                signed_frame=signed_frame,
+                frame_public_key=frame_private_key.public_key(),
+            )
             late_ledger.consume(
                 candidate,
                 schedule,
+                audit_registry=registry,
                 beacon_public_key=beacon_private_key.public_key(),
                 signed_frame=signed_frame,
                 frame_public_key=frame_private_key.public_key(),
@@ -352,6 +368,7 @@ def run() -> dict[str, object]:
         try:
             restarted_late_ledger.observe_beacon_head(
                 signed_beacon_head,
+                audit_registry=registry,
                 beacon_public_key=beacon_private_key.public_key(),
                 signed_frame=signed_frame,
                 frame_public_key=frame_private_key.public_key(),
@@ -440,6 +457,7 @@ def run() -> dict[str, object]:
             evaluation_policy=policy,
             verification_trust=trust,
         )
+        stale.provision_lineage_risk_budget(0.9999)
         stale.register_risk_schedule(schedule)
         stale.handover(state_context=successor, evaluation_policy=policy)
         stale_append = stale.verify_and_append(
@@ -482,6 +500,7 @@ def run() -> dict[str, object]:
             evaluation_policy=policy,
             verification_trust=trust,
         )
+        issued_only.provision_lineage_risk_budget(0.9999)
         issued_only.register_risk_schedule(schedule)
         issued_only.reserve_risk_allocation(
             schedule,
@@ -541,6 +560,7 @@ def run() -> dict[str, object]:
             evaluation_policy=policy,
             verification_trust=trust,
         )
+        issuance_race.provision_lineage_risk_budget(0.9999)
         issuance_race.register_risk_schedule(schedule)
         issuance_race.reserve_risk_allocation(
             schedule,

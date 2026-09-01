@@ -52,3 +52,45 @@ def merkle_root(leaves: list[Any]) -> str:
             for index in range(0, len(level), 2)
         ]
     return level[0].hex()
+
+
+def merkle_path(leaves: list[Any], index: int) -> tuple[tuple[str, bool], ...]:
+    """Return ``(sibling_hash, sibling_is_left)`` steps for one ordered leaf."""
+    if not leaves or isinstance(index, bool) or not 0 <= index < len(leaves):
+        raise ValueError("Merkle path index is outside a non-empty leaf set")
+    level = [bytes.fromhex(digest(leaf)) for leaf in leaves]
+    position = index
+    path: list[tuple[str, bool]] = []
+    while len(level) > 1:
+        if len(level) % 2:
+            level.append(level[-1])
+        sibling_index = position - 1 if position % 2 else position + 1
+        path.append((level[sibling_index].hex(), bool(position % 2)))
+        level = [
+            hashlib.sha256(level[offset] + level[offset + 1]).digest()
+            for offset in range(0, len(level), 2)
+        ]
+        position //= 2
+    return tuple(path)
+
+
+def verify_merkle_path(
+    leaf: Any,
+    path: tuple[tuple[str, bool], ...],
+    expected_root: str,
+) -> bool:
+    """Verify an ordered binary Merkle authentication path."""
+    try:
+        node = bytes.fromhex(digest(leaf))
+        for sibling_hash, sibling_is_left in path:
+            sibling = bytes.fromhex(sibling_hash)
+            if len(sibling) != 32 or not isinstance(sibling_is_left, bool):
+                return False
+            node = (
+                hashlib.sha256(sibling + node).digest()
+                if sibling_is_left
+                else hashlib.sha256(node + sibling).digest()
+            )
+        return node.hex() == expected_root
+    except (TypeError, ValueError):
+        return False

@@ -19,17 +19,20 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
-from .canonical import canonical_bytes, digest
+from .canonical import canonical_bytes, digest, merkle_path, verify_merkle_path
 from .model import (
     BeaconRound,
     Candidate,
     CommitProbe,
     EvaluationPolicy,
     LinearModelArtifact,
+    ProbeGroup,
     RiskSchedule,
     SamplingFrame,
+    SamplingFrameCommitment,
     SamplingFrameEntry,
     SignedSamplingFrame,
+    SignedSamplingFrameCommitment,
     SignedBeaconRound,
     SourcePartition,
     UINT32_MAX,
@@ -232,12 +235,43 @@ class SourceManifestReservation(Protocol):
     ) -> None:
         """Reserve source manifests before the local probe is retired."""
 
+    def observe_beacon_head(
+        self,
+        signed_beacon_head: SignedBeaconRound,
+        *,
+        beacon_public_key: Ed25519PublicKey,
+        signed_frame: SignedSamplingFrame,
+        frame_public_key: Ed25519PublicKey,
+    ) -> None:
+        """Advance the authoritative beacon watcher state."""
+
 
 class RiskScheduleRegistration(Protocol):
     """Canonical context-lineage registry for one lifetime risk schedule."""
 
     def register_risk_schedule(self, schedule: RiskSchedule) -> None:
         """Freeze the exact schedule against the live context and audit head."""
+
+    def reserve_beacon_successor(
+        self,
+        beacon_public_key_hash: str,
+        beacon_id: str,
+        round_number: int,
+        parent_round_hash: str,
+        *,
+        fixation_hash: str,
+    ) -> None:
+        """Reserve one successor globally across all local risk-ledger replicas."""
+
+    def observe_beacon_head(
+        self,
+        signed_beacon_head: SignedBeaconRound,
+        *,
+        beacon_public_key: Ed25519PublicKey,
+        signed_frame: SignedSamplingFrame,
+        frame_public_key: Ed25519PublicKey,
+    ) -> None:
+        """Advance the authoritative beacon watcher state."""
 
 
 class RiskLedger:
@@ -343,6 +377,7 @@ class RiskLedger:
         self,
         signed_beacon_head: SignedBeaconRound,
         *,
+        audit_registry: RiskScheduleRegistration,
         beacon_public_key: Ed25519PublicKey,
         signed_frame: SignedSamplingFrame,
         frame_public_key: Ed25519PublicKey,
@@ -360,6 +395,12 @@ class RiskLedger:
             or not verify_beacon_round(signed_beacon_head, beacon_public_key)
         ):
             raise ValueError("beacon head does not match the signed catalog")
+        audit_registry.observe_beacon_head(
+            signed_beacon_head,
+            beacon_public_key=beacon_public_key,
+            signed_frame=signed_frame,
+            frame_public_key=frame_public_key,
+        )
         with closing(self._connect()) as db:
             db.execute("BEGIN IMMEDIATE")
             prior = db.execute(
@@ -367,7 +408,22 @@ class RiskLedger:
                 "WHERE beacon_public_key_hash=?",
                 (beacon_key_hash,),
             ).fetchone()
-            if prior is not None:
+            if prior is None:
+                exact_checkpoint = (
+                    beacon_head.round_number == frame.beacon_checkpoint_round
+                    and beacon_head.round_hash == frame.beacon_checkpoint_hash
+                )
+                immediate_checkpoint_successor = (
+                    beacon_head.round_number == frame.beacon_checkpoint_round + 1
+                    and beacon_head.previous_round_hash == frame.beacon_checkpoint_hash
+                )
+                if not (exact_checkpoint or immediate_checkpoint_successor):
+                    db.rollback()
+                    raise ValueError(
+                        "first beacon head must equal the signed checkpoint or its "
+                        "immediate authenticated successor"
+                    )
+            else:
                 prior_id, prior_number, prior_hash = (
                     str(prior[0]),
                     int(prior[1]),
@@ -408,6 +464,7 @@ class RiskLedger:
         candidate: Candidate,
         schedule: RiskSchedule,
         *,
+        audit_registry: RiskScheduleRegistration,
         beacon_public_key: Ed25519PublicKey,
         signed_frame: SignedSamplingFrame,
         frame_public_key: Ed25519PublicKey,
@@ -443,10 +500,14 @@ class RiskLedger:
             frame.frame_hash != candidate.sampling_frame_hash
             or frame.catalog_root != candidate.sealed_catalog_root
             or frame.beacon_public_key_hash != beacon_key_hash
+            or candidate.source_partition.partition_hash
+            not in frame.source_partition_hashes
         ):
             raise ValueError(
                 "candidate fixation does not match its authenticated catalog/beacon key"
             )
+        if len(frame.entries) > candidate.evaluation_policy.security_profile.max_catalog_leaves:
+            raise ValueError("sealed catalog exceeds the registered security cap")
         with closing(self._connect()) as db:
             db.execute("BEGIN IMMEDIATE")
             beacon_head = db.execute(
@@ -504,6 +565,13 @@ class RiskLedger:
             expected_reservation = (
                 candidate.beacon_parent_hash,
                 candidate.fixation_hash,
+            )
+            audit_registry.reserve_beacon_successor(
+                beacon_key_hash,
+                frame.beacon_id,
+                candidate.beacon_round,
+                candidate.beacon_parent_hash,
+                fixation_hash=candidate.fixation_hash,
             )
             if reservation is None:
                 try:
@@ -623,11 +691,13 @@ def _selected_shard_root(probe: CommitProbe) -> str:
     return probe.commitment
 
 
-def _sampling_frame_fields(frame: SamplingFrame) -> dict[str, object]:
+def _sampling_frame_fields(
+    frame: SamplingFrame | SamplingFrameCommitment,
+) -> dict[str, object]:
+    commitment = frame.public_commitment if isinstance(frame, SamplingFrame) else frame
     return {
-        "domain": "fedmerit-sealed-catalog-v2",
-        "catalog_root": frame.catalog_root,
-        "frame": frame,
+        "domain": "fedmerit-sealed-catalog-v3",
+        "frame_commitment": commitment,
     }
 
 
@@ -646,6 +716,20 @@ def verify_sampling_frame(
         public_key.verify(
             signed_frame.signature,
             canonical_bytes(_sampling_frame_fields(signed_frame.frame)),
+        )
+    except InvalidSignature:
+        return False
+    return True
+
+
+def verify_sampling_frame_commitment(
+    signed_frame: SignedSamplingFrameCommitment,
+    public_key: Ed25519PublicKey,
+) -> bool:
+    try:
+        public_key.verify(
+            signed_frame.signature,
+            canonical_bytes(_sampling_frame_fields(signed_frame.commitment)),
         )
     except InvalidSignature:
         return False
@@ -719,7 +803,7 @@ def _draw_index(
 def _release_fields(
     candidate: Candidate,
     selected_entry: SamplingFrameEntry,
-    signed_frame: SignedSamplingFrame,
+    signed_frame: SignedSamplingFrame | SignedSamplingFrameCommitment,
     signed_beacon_round: SignedBeaconRound,
     beacon_public_key: bytes,
     commit_probe_commitment: str,
@@ -727,6 +811,11 @@ def _release_fields(
     draw_counter: int,
 ) -> dict[str, object]:
     """The release hash and signature cover exactly this domain-separated map."""
+    frame = (
+        signed_frame.frame.public_commitment
+        if isinstance(signed_frame, SignedSamplingFrame)
+        else signed_frame.commitment
+    )
     return {
         "domain": "fedmerit-release-v1",
         "candidate_hash": candidate.candidate_hash,
@@ -741,8 +830,8 @@ def _release_fields(
         "group_count": candidate.risk.group_count,
         "previous_receipt_hash": candidate.previous_receipt_hash,
         "source_partition_hash": candidate.source_partition.partition_hash,
-        "sampling_frame_hash": signed_frame.frame.frame_hash,
-        "sealed_catalog_root": signed_frame.frame.catalog_root,
+        "sampling_frame_hash": frame.frame_hash,
+        "sealed_catalog_root": frame.catalog_root,
         "sampling_frame_signature_hash": hashlib.sha256(
             signed_frame.signature
         ).hexdigest(),
@@ -767,11 +856,12 @@ def _release_fields(
 class PublicProbeRelease:
     """Public release token; it contains a catalog leaf but no raw probe opening."""
 
-    signed_sampling_frame: SignedSamplingFrame
+    signed_sampling_frame: SignedSamplingFrameCommitment
     candidate_hash: str
     fixation_hash: str
     sealed_catalog_root: str
     selected_catalog_entry: SamplingFrameEntry
+    catalog_membership_path: tuple[tuple[str, bool], ...]
     signed_beacon_round: SignedBeaconRound
     beacon_public_key: bytes
     eligible_probe_id_hashes: tuple[str, ...]
@@ -803,6 +893,12 @@ class PublicProbeRelease:
             bytes.fromhex(probe_id_hash)
         if self.selected_catalog_entry.probe_id_hash not in ids:
             raise ValueError("selected catalog entry is absent from the draw set")
+        path = tuple(self.catalog_membership_path)
+        object.__setattr__(self, "catalog_membership_path", path)
+        for sibling_hash, sibling_is_left in path:
+            if len(sibling_hash) != 64 or not isinstance(sibling_is_left, bool):
+                raise ValueError("catalog membership path contains an invalid step")
+            bytes.fromhex(sibling_hash)
         if (
             isinstance(self.draw_counter, bool)
             or not isinstance(self.draw_counter, int)
@@ -867,12 +963,22 @@ class ProbeRelease:
 
     @property
     def public_release(self) -> PublicProbeRelease:
+        entries = self.signed_sampling_frame.frame.entries
+        selected_index = entries.index(self.probe.frame_entry)
+        path = merkle_path(
+            [
+                {"domain": "fedmerit-sealed-catalog-leaf-v2", "entry": entry}
+                for entry in entries
+            ],
+            selected_index,
+        )
         return PublicProbeRelease(
-            self.signed_sampling_frame,
+            self.signed_sampling_frame.public_commitment,
             self.candidate_hash,
             self.fixation_hash,
             self.sealed_catalog_root,
             self.probe.frame_entry,
+            path,
             self.signed_beacon_round,
             self.beacon_public_key,
             self.eligible_probe_id_hashes,
@@ -918,6 +1024,10 @@ class CommitProbeStore:
             )
         if not verify_sampling_frame(signed_frame, frame_public_key):
             raise ValueError("sampling-frame authority signature is invalid")
+        if tuple(sorted(partition_map)) != signed_frame.frame.source_partition_hashes:
+            raise ValueError(
+                "signed sampling frame does not exactly bind the source partitions"
+            )
         frame_entries = tuple(
             sorted(
                 (probe.frame_entry for probe in probes), key=lambda x: x.probe_id_hash
@@ -1112,6 +1222,12 @@ class CommitProbeStore:
             or not risk_ledger.fixation_precedes_beacon(candidate)
         ):
             raise ValueError("candidate was not durably fixed before beacon release")
+        audit_registry.observe_beacon_head(
+            signed_beacon_round,
+            beacon_public_key=beacon_public_key,
+            signed_frame=self._signed_frame,
+            frame_public_key=self._frame_public_key,
+        )
         excluded = set(candidate.excluded_source_manifests).union(
             self._signed_frame.frame.exclusion_source_manifest_hashes
         )
@@ -1346,15 +1462,25 @@ def verify_public_release(
         or release.fixation_hash != candidate.fixation_hash
     ):
         return False
-    frame = release.signed_sampling_frame.frame
+    frame = release.signed_sampling_frame.commitment
     if (
-        not verify_sampling_frame(release.signed_sampling_frame, frame_public_key)
+        not verify_sampling_frame_commitment(
+            release.signed_sampling_frame, frame_public_key
+        )
         or frame.frame_hash != candidate.sampling_frame_hash
         or frame.catalog_root != candidate.sealed_catalog_root
         or release.sealed_catalog_root != candidate.sealed_catalog_root
         or frame.context_hash != candidate.context_hash
         or frame.policy_hash != candidate.probe_policy_hash
-        or release.selected_catalog_entry not in frame.entries
+        or candidate.source_partition.partition_hash not in frame.source_partition_hashes
+        or not verify_merkle_path(
+            {
+                "domain": "fedmerit-sealed-catalog-leaf-v2",
+                "entry": release.selected_catalog_entry,
+            },
+            release.catalog_membership_path,
+            frame.catalog_root,
+        )
     ):
         return False
     selected_entry = release.selected_catalog_entry
@@ -1382,7 +1508,7 @@ def verify_public_release(
         or not verify_beacon_round(release.signed_beacon_round, beacon_public_key)
     ):
         return False
-    frame_ids = {entry.probe_id_hash for entry in frame.entries}
+    frame_ids = set(frame.catalog_id_hashes)
     if release.eligible_probe_id_hashes != candidate.eligible_probe_id_hashes or any(
         item not in frame_ids for item in release.eligible_probe_id_hashes
     ):
@@ -1511,26 +1637,43 @@ def _group_brier_quanta(
         )
 
 
+def paired_model_loss_difference_exact(
+    before_model: LinearModelArtifact,
+    after_model: LinearModelArtifact,
+    groups: tuple[ProbeGroup, ...],
+    policy: EvaluationPolicy,
+) -> Fraction:
+    """Replay the exact registered paired loss for two concrete model artifacts."""
+    if not groups:
+        raise ValueError("paired replay requires at least one source group")
+    if tuple(group.group_id for group in groups) != tuple(
+        sorted(group.group_id for group in groups)
+    ):
+        raise ValueError("probe group order is not canonical")
+    differences: list[int] = []
+    for group in groups:
+        before = _group_brier_quanta(
+            before_model, group.features, group.labels, policy
+        )
+        after = _group_brier_quanta(
+            after_model, group.features, group.labels, policy
+        )
+        differences.append(after - before)
+    quanta_per_unit = int(Decimal(1) / Decimal(policy.group_loss_quantum))
+    return Fraction(sum(differences), len(differences) * quanta_per_unit)
+
+
 def paired_loss_difference_exact(candidate: Candidate, probe: CommitProbe) -> Fraction:
     """Return the exact mean of the policy-quantized paired group losses."""
     policy = candidate.evaluation_policy
     if probe.probe_policy_hash != policy.policy_hash:
         raise ValueError("probe and candidate evaluator policies differ")
-    if tuple(group.group_id for group in probe.groups) != tuple(
-        sorted(group.group_id for group in probe.groups)
-    ):
-        raise ValueError("probe group order is not canonical")
-    differences: list[int] = []
-    for group in probe.groups:
-        before = _group_brier_quanta(
-            candidate.before_model, group.features, group.labels, policy
-        )
-        after = _group_brier_quanta(
-            candidate.after_model, group.features, group.labels, policy
-        )
-        differences.append(after - before)
-    quanta_per_unit = int(Decimal(1) / Decimal(policy.group_loss_quantum))
-    return Fraction(sum(differences), len(differences) * quanta_per_unit)
+    return paired_model_loss_difference_exact(
+        candidate.before_model,
+        candidate.after_model,
+        probe.groups,
+        policy,
+    )
 
 
 def paired_loss_difference(candidate: Candidate, probe: CommitProbe) -> float:

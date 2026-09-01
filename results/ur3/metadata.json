@@ -1,0 +1,56 @@
+{
+  "attacks": [
+    "none",
+    "sign_flip",
+    "model_replacement"
+  ],
+  "byzantine_fraction": 0.2,
+  "clients_per_round": 30,
+  "dataset": {
+    "doi": "10.24432/C5J891",
+    "name": "UCI UR3 CobotOps",
+    "operation_cycle_groups": 240,
+    "rows_after_complete_case_filter": 7355
+  },
+  "elapsed_seconds": 346.025174001,
+  "pretrain_rounds": 20,
+  "records": 360,
+  "risk": {
+    "alpha": 0.1,
+    "epsilon": 0.35,
+    "gamma": 0.0,
+    "group_count": 38,
+    "operational_harm_threshold": 0.05,
+    "verified_bound": 0.09753929075999906
+  },
+  "schema": "fedmerit/ur3-noniid-benchmark/v1",
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19
+  ],
+  "split_groups_per_seed": {
+    "commit_pool": 40,
+    "commit_selected": 38,
+    "independent_audit": 40,
+    "proposal": 120,
+    "score": 40
+  }
+}

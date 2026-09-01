@@ -17,7 +17,17 @@
     "group_order": "ascending-group-id",
     "missing_value_rule": "reject",
     "class_weights": [1.0, 1.0],
-    "group_reduction": "class-weighted-row-mean-then-clip-[0,1]"
+    "group_reduction": "class-weighted-row-mean-then-clip-[0,1]",
+    "security_profile": {
+      "security_parameter_bits": 256,
+      "max_attempts": 1000,
+      "max_catalog_leaves": 4096,
+      "max_verification_keys": 64,
+      "max_hash_queries": 1099511627776,
+      "max_collision_queries": 4294967296,
+      "max_signature_queries": 4294967296,
+      "max_beacon_queries": 4294967296
+    }
   },
   "sampling_frame_policy": {
     "descriptor": "sealed-opaque-catalog-v1",

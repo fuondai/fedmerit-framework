@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .gate import required_groups, risk_bound, risk_is_satisfied
-from .model import EvaluationPolicy
+from .model import EvaluationPolicy, SecurityProfile
 
 
 MAX_MANIFEST_BYTES = 1_048_576
@@ -185,8 +185,26 @@ def validate_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
             "missing_value_rule",
             "class_weights",
             "group_reduction",
+            "security_profile",
         },
         "evaluation_policy",
+    )
+    security = _object(
+        policy.get("security_profile"), "evaluation_policy.security_profile"
+    )
+    _exact_keys(
+        security,
+        {
+            "security_parameter_bits",
+            "max_attempts",
+            "max_catalog_leaves",
+            "max_verification_keys",
+            "max_hash_queries",
+            "max_collision_queries",
+            "max_signature_queries",
+            "max_beacon_queries",
+        },
+        "evaluation_policy.security_profile",
     )
     try:
         EvaluationPolicy(
@@ -202,6 +220,7 @@ def validate_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
             missing_value_rule=policy.get("missing_value_rule"),
             class_weights=tuple(policy.get("class_weights", ())),
             group_reduction=policy.get("group_reduction"),
+            security_profile=SecurityProfile(**security),
         )
     except (TypeError, ValueError) as exc:
         raise ValueError(f"invalid evaluation_policy: {exc}") from exc

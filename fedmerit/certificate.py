@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import sqlite3
 from contextlib import closing
@@ -23,8 +24,10 @@ from .gate import (
     RiskLedger,
     gate_decision,
     risk_is_satisfied,
+    verify_beacon_round,
     verify_public_release,
     verify_release,
+    verify_sampling_frame,
 )
 from .canonical import canonical_bytes, digest
 from .model import (
@@ -34,7 +37,10 @@ from .model import (
     Receipt,
     ReceiptCore,
     RiskSchedule,
+    SignedBeaconRound,
+    SignedSamplingFrame,
     StateContext,
+    UINT32_MAX,
     WitnessSignature,
     ZERO_HASH,
 )
@@ -76,6 +82,8 @@ class VerificationTrust:
             raise ValueError("f must be a non-negative integer")
         if len(self.witness_public_keys) != 3 * self.f + 1:
             raise ValueError("witness trust must contain exactly 3f+1 keys")
+        if len(self.witness_public_keys) > 64:
+            raise ValueError("witness trust exceeds the registered key cap")
         if (
             any(len(key) != 32 for key in self.witness_public_keys)
             or len(set(self.witness_public_keys)) != len(self.witness_public_keys)
@@ -363,25 +371,38 @@ class CertificateAuthority:
             candidate.state_context.authority_certificate_hash,
             trust,
         )
-        core: ReceiptCore | None = None
-        signatures: list[WitnessSignature] = []
-        for witness in self.witnesses[: 2 * self.f + 1]:
-            replayed, signature = witness.attest(
-                candidate,
-                release,
-                store_public_key=store_public_key,
-                frame_public_key=frame_public_key,
-                schedule=schedule,
-                risk_ledger=risk_ledger,
-                audit_registry=audit_registry,
-            )
-            if core is not None and replayed != core:
-                raise ValueError("witness replay produced a conflicting receipt core")
-            core = replayed
-            signatures.append(signature)
-        if core is None:
-            raise RuntimeError("certificate issuance produced no witness replay")
-        receipt = Receipt(core, len(self.witnesses), tuple(signatures))
+        threshold = 2 * self.f + 1
+        buckets: dict[str, tuple[ReceiptCore, list[WitnessSignature]]] = {}
+        for witness in self.witnesses:
+            try:
+                replayed, signature = witness.attest(
+                    candidate,
+                    release,
+                    store_public_key=store_public_key,
+                    frame_public_key=frame_public_key,
+                    schedule=schedule,
+                    risk_ledger=risk_ledger,
+                    audit_registry=audit_registry,
+                )
+                if signature.witness_index != witness.witness_index:
+                    continue
+                witness.public_key.verify(signature.signature, replayed.to_bytes())
+            except Exception:
+                continue
+            key = replayed.receipt_hash
+            bucket = buckets.setdefault(key, (replayed, []))
+            if bucket[0] != replayed:
+                continue
+            bucket[1].append(signature)
+            if len(bucket[1]) == threshold:
+                receipt = Receipt(
+                    replayed,
+                    len(self.witnesses),
+                    tuple(sorted(bucket[1], key=lambda item: item.witness_index)),
+                )
+                break
+        else:
+            raise ValueError("fewer than 2f+1 witnesses returned one valid replay core")
         audit_registry.record_issued_receipt(
             receipt,
             candidate=candidate,
@@ -639,6 +660,7 @@ class AuditRegistry:
         if initial_context.policy_hash != evaluation_policy.policy_hash:
             raise ValueError("initial context does not authorize the evaluation policy")
         self.path = str(path)
+        self._evaluation_policy = evaluation_policy
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as db:
             db.executescript("""
@@ -716,6 +738,49 @@ class AuditRegistry:
                     fixation_hash TEXT NOT NULL,
                     PRIMARY KEY(schedule_hash, allocation_index)
                 );
+                CREATE TABLE IF NOT EXISTS beacon_successor_reservations(
+                    beacon_public_key_hash TEXT NOT NULL,
+                    round_number INTEGER NOT NULL,
+                    parent_round_hash TEXT NOT NULL,
+                    fixation_hash TEXT UNIQUE NOT NULL,
+                    PRIMARY KEY(beacon_public_key_hash, round_number)
+                );
+                CREATE TABLE IF NOT EXISTS beacon_heads(
+                    beacon_public_key_hash TEXT PRIMARY KEY,
+                    beacon_id TEXT NOT NULL,
+                    round_number INTEGER NOT NULL,
+                    round_hash TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS lineage_security_caps(
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    twin_id TEXT UNIQUE NOT NULL,
+                    profile_blob BLOB NOT NULL,
+                    max_attempts INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS risk_schedule_usage(
+                    schedule_hash TEXT PRIMARY KEY,
+                    attempt_count INTEGER NOT NULL CHECK(attempt_count > 0)
+                );
+                CREATE TABLE IF NOT EXISTS protocol_events(
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type TEXT NOT NULL,
+                    context_hash TEXT NOT NULL,
+                    object_hash TEXT NOT NULL,
+                    detail_hash TEXT NOT NULL,
+                    previous_event_hash TEXT NOT NULL,
+                    event_hash TEXT UNIQUE NOT NULL,
+                    UNIQUE(event_type, object_hash)
+                );
+                CREATE TRIGGER IF NOT EXISTS protocol_events_no_update
+                BEFORE UPDATE ON protocol_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'protocol event journal is append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS protocol_events_no_delete
+                BEFORE DELETE ON protocol_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'protocol event journal is append-only');
+                END;
             """)
             context_columns = tuple(
                 row[1] for row in db.execute("PRAGMA table_info(context_head)")
@@ -869,9 +934,302 @@ class AuditRegistry:
                     initial_context.authority_certificate_hash,
                     verification_trust,
                 )
+            for schedule_hash, schedule_blob in db.execute(
+                "SELECT schedule_hash, schedule_blob FROM risk_schedules"
+            ).fetchall():
+                try:
+                    attempt_count = len(json.loads(bytes(schedule_blob))["allocations"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError("registered risk schedule has invalid canonical bytes") from exc
+                if attempt_count <= 0:
+                    raise ValueError("registered risk schedule has no finite allocations")
+                db.execute(
+                    "INSERT OR IGNORE INTO risk_schedule_usage VALUES(?,?)",
+                    (str(schedule_hash), attempt_count),
+                )
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.path, timeout=30, isolation_level=None)
+
+    @staticmethod
+    def _append_event_locked(
+        db: sqlite3.Connection,
+        *,
+        event_type: str,
+        context_hash: str,
+        object_hash: str,
+        details: object,
+    ) -> str:
+        """Append one idempotent, hash-linked protocol event in the caller transaction."""
+        if not event_type or not event_type.isascii():
+            raise ValueError("event_type must be non-empty ASCII")
+        _require_digest(context_hash, "event context_hash")
+        _require_digest(object_hash, "event object_hash")
+        detail_hash = digest(details)
+        prior = db.execute(
+            "SELECT context_hash, detail_hash, event_hash FROM protocol_events "
+            "WHERE event_type=? AND object_hash=?",
+            (event_type, object_hash),
+        ).fetchone()
+        if prior is not None:
+            if (str(prior[0]), str(prior[1])) != (context_hash, detail_hash):
+                raise ValueError("protocol event identity is bound to different content")
+            return str(prior[2])
+        predecessor = db.execute(
+            "SELECT event_hash FROM protocol_events ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        previous_event_hash = ZERO_HASH if predecessor is None else str(predecessor[0])
+        event_hash = digest(
+            {
+                "domain": "fedmerit-protocol-event-v1",
+                "previous_event_hash": previous_event_hash,
+                "event_type": event_type,
+                "context_hash": context_hash,
+                "object_hash": object_hash,
+                "detail_hash": detail_hash,
+            }
+        )
+        db.execute(
+            "INSERT INTO protocol_events "
+            "(event_type,context_hash,object_hash,detail_hash,previous_event_hash,event_hash) "
+            "VALUES(?,?,?,?,?,?)",
+            (
+                event_type,
+                context_hash,
+                object_hash,
+                detail_hash,
+                previous_event_hash,
+                event_hash,
+            ),
+        )
+        return event_hash
+
+    @property
+    def protocol_events(self) -> tuple[dict[str, object], ...]:
+        """Return the canonical event chain for audit and recovery checks."""
+        with closing(self._connect()) as db:
+            rows = db.execute(
+                "SELECT sequence,event_type,context_hash,object_hash,detail_hash,"
+                "previous_event_hash,event_hash FROM protocol_events ORDER BY sequence"
+            ).fetchall()
+        return tuple(
+            {
+                "sequence": int(row[0]),
+                "event_type": str(row[1]),
+                "context_hash": str(row[2]),
+                "object_hash": str(row[3]),
+                "detail_hash": str(row[4]),
+                "previous_event_hash": str(row[5]),
+                "event_hash": str(row[6]),
+            }
+            for row in rows
+        )
+
+    def protocol_event_chain_valid(self) -> bool:
+        """Verify sequence continuity and every stored event-chain digest."""
+        previous = ZERO_HASH
+        for expected_sequence, event in enumerate(self.protocol_events, start=1):
+            if (
+                event["sequence"] != expected_sequence
+                or event["previous_event_hash"] != previous
+            ):
+                return False
+            expected_hash = digest(
+                {
+                    "domain": "fedmerit-protocol-event-v1",
+                    "previous_event_hash": previous,
+                    "event_type": event["event_type"],
+                    "context_hash": event["context_hash"],
+                    "object_hash": event["object_hash"],
+                    "detail_hash": event["detail_hash"],
+                }
+            )
+            if event["event_hash"] != expected_hash:
+                return False
+            previous = expected_hash
+        return True
+
+    def reserve_beacon_successor(
+        self,
+        beacon_public_key_hash: str,
+        beacon_id: str,
+        round_number: int,
+        parent_round_hash: str,
+        *,
+        fixation_hash: str,
+    ) -> None:
+        """Burn one beacon successor for one fixation at the authoritative head.
+
+        Risk ledgers may be replicated or recreated, so successor exclusivity
+        cannot live only in a local ledger database. A failed downstream release
+        deliberately leaves this reservation spent.
+        """
+        if not isinstance(beacon_id, str) or not beacon_id.strip():
+            raise ValueError("beacon_id must be a non-empty string")
+        for name, value in (
+            ("beacon_public_key_hash", beacon_public_key_hash),
+            ("parent_round_hash", parent_round_hash),
+            ("fixation_hash", fixation_hash),
+        ):
+            if not isinstance(value, str) or len(value) != 64:
+                raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+            try:
+                bytes.fromhex(value)
+            except ValueError as exc:
+                raise ValueError(f"{name} must be a lowercase SHA-256 digest") from exc
+            if value != value.lower():
+                raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+        if (
+            isinstance(round_number, bool)
+            or not isinstance(round_number, int)
+            or not 0 <= round_number <= UINT32_MAX
+        ):
+            raise ValueError("round_number must be uint32")
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            head = db.execute(
+                "SELECT beacon_id, round_number, round_hash FROM beacon_heads "
+                "WHERE beacon_public_key_hash=?",
+                (beacon_public_key_hash,),
+            ).fetchone()
+            if (
+                head is None
+                or str(head[0]) != beacon_id
+                or int(head[1]) + 1 != round_number
+                or str(head[2]) != parent_round_hash
+            ):
+                db.rollback()
+                raise ValueError(
+                    "fixation must reserve the immediate successor of the "
+                    "authoritative beacon head"
+                )
+            row = db.execute(
+                "SELECT parent_round_hash, fixation_hash "
+                "FROM beacon_successor_reservations "
+                "WHERE beacon_public_key_hash=? AND round_number=?",
+                (beacon_public_key_hash, round_number),
+            ).fetchone()
+            expected = (parent_round_hash, fixation_hash)
+            if row is None:
+                try:
+                    db.execute(
+                        "INSERT INTO beacon_successor_reservations VALUES(?,?,?,?)",
+                        (
+                            beacon_public_key_hash,
+                            round_number,
+                            parent_round_hash,
+                            fixation_hash,
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    db.rollback()
+                    raise ValueError(
+                        "beacon successor is already reserved by another fixation"
+                    ) from exc
+            elif (str(row[0]), str(row[1])) != expected:
+                db.rollback()
+                raise ValueError(
+                    "beacon successor is already reserved by another fixation"
+                )
+            context_hash = str(
+                db.execute("SELECT context_hash FROM context_head WHERE id=1").fetchone()[0]
+            )
+            self._append_event_locked(
+                db,
+                event_type="beacon-successor-reserved",
+                context_hash=context_hash,
+                object_hash=fixation_hash,
+                details={
+                    "beacon_public_key_hash": beacon_public_key_hash,
+                    "beacon_id": beacon_id,
+                    "round_number": round_number,
+                    "parent_round_hash": parent_round_hash,
+                },
+            )
+            db.commit()
+
+    def observe_beacon_head(
+        self,
+        signed_beacon_head: SignedBeaconRound,
+        *,
+        beacon_public_key: Ed25519PublicKey,
+        signed_frame: SignedSamplingFrame,
+        frame_public_key: Ed25519PublicKey,
+    ) -> None:
+        """Advance the canonical watcher state shared by every risk ledger."""
+        if not verify_sampling_frame(signed_frame, frame_public_key):
+            raise ValueError("beacon observation needs an authenticated sealed catalog")
+        frame = signed_frame.frame
+        raw_beacon_key = _raw_public_key(beacon_public_key)
+        beacon_key_hash = hashlib.sha256(raw_beacon_key).hexdigest()
+        beacon_head = signed_beacon_head.round
+        if (
+            frame.beacon_public_key_hash != beacon_key_hash
+            or frame.beacon_id != beacon_head.beacon_id
+            or not verify_beacon_round(signed_beacon_head, beacon_public_key)
+        ):
+            raise ValueError("beacon head does not match the signed catalog")
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            prior = db.execute(
+                "SELECT beacon_id, round_number, round_hash FROM beacon_heads "
+                "WHERE beacon_public_key_hash=?",
+                (beacon_key_hash,),
+            ).fetchone()
+            if prior is None:
+                valid = (
+                    beacon_head.round_number == frame.beacon_checkpoint_round
+                    and beacon_head.round_hash == frame.beacon_checkpoint_hash
+                )
+            else:
+                valid = (
+                    str(prior[0]) == beacon_head.beacon_id
+                    and int(prior[1]) == beacon_head.round_number
+                    and str(prior[2]) == beacon_head.round_hash
+                ) or (
+                    str(prior[0]) == beacon_head.beacon_id
+                    and beacon_head.round_number == int(prior[1]) + 1
+                    and beacon_head.previous_round_hash == str(prior[2])
+                )
+            if not valid:
+                db.rollback()
+                raise ValueError(
+                    "authoritative beacon head must begin at the signed checkpoint "
+                    "and advance one hash-linked round"
+                )
+            db.execute(
+                "INSERT INTO beacon_heads VALUES(?,?,?,?) "
+                "ON CONFLICT(beacon_public_key_hash) DO UPDATE SET "
+                "beacon_id=excluded.beacon_id, round_number=excluded.round_number, "
+                "round_hash=excluded.round_hash",
+                (
+                    beacon_key_hash,
+                    beacon_head.beacon_id,
+                    beacon_head.round_number,
+                    beacon_head.round_hash,
+                ),
+            )
+            context_hash = str(
+                db.execute("SELECT context_hash FROM context_head WHERE id=1").fetchone()[0]
+            )
+            self._append_event_locked(
+                db,
+                event_type="beacon-head-observed",
+                context_hash=context_hash,
+                object_hash=digest(
+                    {
+                        "context_hash": context_hash,
+                        "round_hash": beacon_head.round_hash,
+                    }
+                ),
+                details={
+                    "beacon_public_key_hash": beacon_key_hash,
+                    "beacon_id": beacon_head.beacon_id,
+                    "round_number": beacon_head.round_number,
+                    "round_hash": beacon_head.round_hash,
+                },
+            )
+            db.commit()
 
     @property
     def head(self) -> str:
@@ -1026,7 +1384,12 @@ class AuditRegistry:
             twin_id = str(
                 db.execute("SELECT twin_id FROM context_head WHERE id=1").fetchone()[0]
             )
+            context_hash = str(
+                db.execute("SELECT context_hash FROM context_head WHERE id=1").fetchone()[0]
+            )
             head = str(db.execute("SELECT head FROM audit_state WHERE id=1").fetchone()[0])
+            profile = self._evaluation_policy.security_profile
+            profile_blob = canonical_bytes(profile)
             prior = db.execute(
                 "SELECT twin_id, anchor_receipt_hash, lifetime_delta "
                 "FROM lineage_risk_budget WHERE id=1"
@@ -1036,6 +1399,26 @@ class AuditRegistry:
                 if (str(prior[0]), str(prior[1]), float(prior[2])) != expected:
                     db.rollback()
                     raise ValueError("lineage risk budget is already frozen")
+                caps = db.execute(
+                    "SELECT twin_id, profile_blob, max_attempts "
+                    "FROM lineage_security_caps WHERE id=1"
+                ).fetchone()
+                expected_caps = (twin_id, profile_blob, profile.max_attempts)
+                if caps is None:
+                    db.execute(
+                        "INSERT INTO lineage_security_caps VALUES(1,?,?,?)",
+                        expected_caps,
+                    )
+                elif (str(caps[0]), bytes(caps[1]), int(caps[2])) != expected_caps:
+                    db.rollback()
+                    raise ValueError("lineage security profile is already frozen")
+                self._append_event_locked(
+                    db,
+                    event_type="lineage-budget-provisioned",
+                    context_hash=context_hash,
+                    object_hash=digest({"twin_id": twin_id, "anchor": head}),
+                    details={"lifetime_delta": lifetime_delta, "profile": profile},
+                )
                 db.commit()
                 return
             if db.execute("SELECT 1 FROM risk_schedules LIMIT 1").fetchone() is not None:
@@ -1043,6 +1426,17 @@ class AuditRegistry:
                 raise ValueError("lineage risk budget must precede every schedule")
             db.execute(
                 "INSERT INTO lineage_risk_budget VALUES(1,?,?,?)", expected
+            )
+            db.execute(
+                "INSERT INTO lineage_security_caps VALUES(1,?,?,?)",
+                (twin_id, profile_blob, profile.max_attempts),
+            )
+            self._append_event_locked(
+                db,
+                event_type="lineage-budget-provisioned",
+                context_hash=context_hash,
+                object_hash=digest({"twin_id": twin_id, "anchor": head}),
+                details={"lifetime_delta": lifetime_delta, "profile": profile},
             )
             db.commit()
 
@@ -1101,6 +1495,17 @@ class AuditRegistry:
                     raise ValueError(
                         "a different lifetime schedule is already frozen for this context"
                     )
+                self._append_event_locked(
+                    db,
+                    event_type="risk-schedule-registered",
+                    context_hash=schedule.context_hash,
+                    object_hash=schedule.schedule_hash,
+                    details={
+                        "anchor_receipt_hash": schedule.anchor_receipt_hash,
+                        "lifetime_delta": schedule.lifetime_delta,
+                        "attempt_count": len(schedule.allocations),
+                    },
+                )
                 db.commit()
                 return
             live_context = str(
@@ -1122,30 +1527,50 @@ class AuditRegistry:
             lineage = db.execute(
                 "SELECT twin_id, lifetime_delta FROM lineage_risk_budget WHERE id=1"
             ).fetchone()
-            if lineage is not None:
-                live_twin = str(
-                    db.execute(
-                        "SELECT twin_id FROM context_head WHERE id=1"
-                    ).fetchone()[0]
+            if lineage is None:
+                db.rollback()
+                raise ValueError(
+                    "lineage risk budget must be provisioned before every schedule"
                 )
-                if str(lineage[0]) != live_twin:
-                    db.rollback()
-                    raise ValueError("lineage risk budget belongs to another twin")
-                allocated = sum(
-                    (
-                        Fraction.from_float(float(row[0]))
-                        for row in db.execute(
-                            "SELECT lifetime_delta FROM risk_schedules"
-                        ).fetchall()
-                    ),
-                    Fraction(),
+            live_twin = str(
+                db.execute(
+                    "SELECT twin_id FROM context_head WHERE id=1"
+                ).fetchone()[0]
+            )
+            if str(lineage[0]) != live_twin:
+                db.rollback()
+                raise ValueError("lineage risk budget belongs to another twin")
+            caps = db.execute(
+                "SELECT twin_id, max_attempts FROM lineage_security_caps WHERE id=1"
+            ).fetchone()
+            if caps is None or str(caps[0]) != live_twin:
+                db.rollback()
+                raise ValueError("lineage security profile must precede every schedule")
+            attempts_used = int(
+                db.execute(
+                    "SELECT COALESCE(SUM(attempt_count),0) FROM risk_schedule_usage"
+                ).fetchone()[0]
+            )
+            if attempts_used + len(schedule.allocations) > int(caps[1]):
+                db.rollback()
+                raise ValueError(
+                    "risk schedules exceed the cross-handover lifetime attempt cap"
                 )
-                proposed = allocated + Fraction.from_float(schedule.lifetime_delta)
-                if proposed > Fraction.from_float(float(lineage[1])):
-                    db.rollback()
-                    raise ValueError(
-                        "context schedule exceeds the cross-handover lineage budget"
-                    )
+            allocated = sum(
+                (
+                    Fraction.from_float(float(row[0]))
+                    for row in db.execute(
+                        "SELECT lifetime_delta FROM risk_schedules"
+                    ).fetchall()
+                ),
+                Fraction(),
+            )
+            proposed = allocated + Fraction.from_float(schedule.lifetime_delta)
+            if proposed > Fraction.from_float(float(lineage[1])):
+                db.rollback()
+                raise ValueError(
+                    "context schedule exceeds the cross-handover lineage budget"
+                )
             try:
                 db.execute(
                     "INSERT INTO risk_schedules VALUES(?,?,?,?,?)",
@@ -1157,9 +1582,24 @@ class AuditRegistry:
                         blob,
                     ),
                 )
+                db.execute(
+                    "INSERT INTO risk_schedule_usage VALUES(?,?)",
+                    (schedule.schedule_hash, len(schedule.allocations)),
+                )
             except sqlite3.IntegrityError as exc:
                 db.rollback()
                 raise ValueError("conflicting canonical risk schedule") from exc
+            self._append_event_locked(
+                db,
+                event_type="risk-schedule-registered",
+                context_hash=schedule.context_hash,
+                object_hash=schedule.schedule_hash,
+                details={
+                    "anchor_receipt_hash": schedule.anchor_receipt_hash,
+                    "lifetime_delta": schedule.lifetime_delta,
+                    "attempt_count": len(schedule.allocations),
+                },
+            )
             db.commit()
 
     def require_risk_schedule(self, schedule: RiskSchedule) -> None:
@@ -1206,6 +1646,16 @@ class AuditRegistry:
                     raise ValueError(
                         "risk allocation has already been spent by another fixation"
                     )
+                self._append_event_locked(
+                    db,
+                    event_type="risk-allocation-spent",
+                    context_hash=schedule.context_hash,
+                    object_hash=fixation_hash,
+                    details={
+                        "schedule_hash": schedule.schedule_hash,
+                        "allocation_index": allocation_index,
+                    },
+                )
                 db.commit()
                 return
             db.execute(
@@ -1216,6 +1666,16 @@ class AuditRegistry:
                     schedule.context_hash,
                     fixation_hash,
                 ),
+            )
+            self._append_event_locked(
+                db,
+                event_type="risk-allocation-spent",
+                context_hash=schedule.context_hash,
+                object_hash=fixation_hash,
+                details={
+                    "schedule_hash": schedule.schedule_hash,
+                    "allocation_index": allocation_index,
+                },
             )
             db.commit()
 
@@ -1257,6 +1717,18 @@ class AuditRegistry:
                 db.rollback()
                 raise ValueError(
                     "handover model version must equal the installed model version"
+                )
+            lineage_caps = db.execute(
+                "SELECT twin_id, profile_blob FROM lineage_security_caps WHERE id=1"
+            ).fetchone()
+            if lineage_caps is not None and (
+                str(lineage_caps[0]) != state_context.twin_id
+                or bytes(lineage_caps[1])
+                != canonical_bytes(evaluation_policy.security_profile)
+            ):
+                db.rollback()
+                raise ValueError(
+                    "handover must preserve the lineage security profile"
                 )
             registered = db.execute(
                 "SELECT policy_blob FROM evaluation_policies WHERE policy_hash=?",
@@ -1327,7 +1799,20 @@ class AuditRegistry:
                     state_context.model_version,
                 ),
             )
+            self._append_event_locked(
+                db,
+                event_type="context-handover",
+                context_hash=state_context.context_hash,
+                object_hash=state_context.context_hash,
+                details={
+                    "previous_context_hash": str(live_context_hash),
+                    "twin_id": state_context.twin_id,
+                    "state_version": state_context.state_version,
+                    "model_version": state_context.model_version,
+                },
+            )
             db.commit()
+        self._evaluation_policy = evaluation_policy
 
     def validate_candidate(
         self, candidate: Candidate, *, receipt_hash: str | None = None
@@ -1496,6 +1981,17 @@ class AuditRegistry:
                 if existing != expected:
                     db.rollback()
                     raise ValueError("receipt hash is bound to another issuance")
+                self._append_event_locked(
+                    db,
+                    event_type="receipt-issued",
+                    context_hash=candidate.context_hash,
+                    object_hash=receipt.receipt_hash,
+                    details={
+                        "fixation_hash": candidate.fixation_hash,
+                        "schedule_hash": schedule.schedule_hash,
+                        "schedule_index": candidate.risk_schedule_index,
+                    },
+                )
                 db.commit()
                 return
             try:
@@ -1506,6 +2002,17 @@ class AuditRegistry:
             except sqlite3.IntegrityError as exc:
                 db.rollback()
                 raise ValueError("conflicting issued attempt or risk allocation") from exc
+            self._append_event_locked(
+                db,
+                event_type="receipt-issued",
+                context_hash=candidate.context_hash,
+                object_hash=receipt.receipt_hash,
+                details={
+                    "fixation_hash": candidate.fixation_hash,
+                    "schedule_hash": schedule.schedule_hash,
+                    "schedule_index": candidate.risk_schedule_index,
+                },
+            )
             db.commit()
 
     @staticmethod
@@ -1565,6 +2072,19 @@ class AuditRegistry:
             except Exception:
                 db.rollback()
                 raise
+            self._append_event_locked(
+                db,
+                event_type="source-manifests-retired",
+                context_hash=context_hash,
+                object_hash=digest(
+                    {"fixation_hash": fixation_hash, "probe_id_hash": probe_id_hash}
+                ),
+                details={
+                    "fixation_hash": fixation_hash,
+                    "probe_id_hash": probe_id_hash,
+                    "source_manifest_hashes": tuple(source_manifest_hashes),
+                },
+            )
             db.commit()
 
     def _append(
@@ -1643,6 +2163,27 @@ class AuditRegistry:
                     raise ValueError(
                         "receipt hash is bound to another historical append"
                     )
+                installed_state = db.execute(
+                    "SELECT installed_model_hash, installed_model_version "
+                    "FROM audit_state WHERE id=1"
+                ).fetchone()
+                self._append_event_locked(
+                    db,
+                    event_type="receipt-appended",
+                    context_hash=core.context_hash,
+                    object_hash=receipt.receipt_hash,
+                    details={
+                        "decision": core.decision,
+                        "previous_receipt_hash": core.previous_receipt_hash,
+                        "installed_model_hash": str(installed_state[0]),
+                        "installed_model_version": int(installed_state[1]),
+                        "successor_context_hash": (
+                            candidate.state_context.model_successor().context_hash
+                            if core.decision == "commit"
+                            else None
+                        ),
+                    },
+                )
                 db.commit()
                 return
             live_context, live_authority, live_policy = db.execute(
@@ -1818,6 +2359,23 @@ class AuditRegistry:
                 "UPDATE audit_state SET head=?, installed_model_hash=?, "
                 "installed_model_version=? WHERE id=1",
                 (receipt.receipt_hash, installed_next, installed_version_next),
+            )
+            self._append_event_locked(
+                db,
+                event_type="receipt-appended",
+                context_hash=core.context_hash,
+                object_hash=receipt.receipt_hash,
+                details={
+                    "decision": core.decision,
+                    "previous_receipt_hash": core.previous_receipt_hash,
+                    "installed_model_hash": installed_next,
+                    "installed_model_version": installed_version_next,
+                    "successor_context_hash": (
+                        None
+                        if successor_context is None
+                        else successor_context.context_hash
+                    ),
+                },
             )
             db.commit()
 

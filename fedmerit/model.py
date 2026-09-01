@@ -63,6 +63,36 @@ def _binary64(name: str, value: float) -> float:
 
 
 @dataclass(frozen=True)
+class SecurityProfile:
+    """Finite lifetime/query caps used by the computational reduction."""
+
+    security_parameter_bits: int = 256
+    max_attempts: int = 1_000
+    max_catalog_leaves: int = 4_096
+    max_verification_keys: int = 64
+    max_hash_queries: int = 1 << 40
+    max_collision_queries: int = 1 << 32
+    max_signature_queries: int = 1 << 32
+    max_beacon_queries: int = 1 << 32
+
+    def __post_init__(self) -> None:
+        if self.security_parameter_bits != 256:
+            raise ValueError("reference commitments require 256-bit security parameters")
+        for name in (
+            "max_attempts",
+            "max_catalog_leaves",
+            "max_verification_keys",
+            "max_hash_queries",
+            "max_collision_queries",
+            "max_signature_queries",
+            "max_beacon_queries",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+
+
+@dataclass(frozen=True)
 class EvaluationPolicy:
     """Canonical evaluator contract committed by the state context."""
 
@@ -77,6 +107,7 @@ class EvaluationPolicy:
     missing_value_rule: str = "reject"
     class_weights: tuple[float, float] = (1.0, 1.0)
     group_reduction: str = "class-weighted-row-mean-then-clip-[0,1]"
+    security_profile: SecurityProfile = field(default_factory=SecurityProfile)
 
     def __post_init__(self) -> None:
         _required("policy_id", self.policy_id)
@@ -110,6 +141,8 @@ class EvaluationPolicy:
             _finite("class weight", float(weight))
             if weight <= 0:
                 raise ValueError("class weights must be positive")
+        if not isinstance(self.security_profile, SecurityProfile):
+            raise TypeError("security_profile must be a SecurityProfile")
 
     @property
     def policy_hash(self) -> str:
@@ -241,6 +274,40 @@ class ProbeGroup:
 
 
 @dataclass(frozen=True)
+class ContributorLeaf:
+    """Canonical contributor commitment used to construct ``contributor_root``."""
+
+    client_id: str
+    update_hash: str
+    weight: float
+
+    def __post_init__(self) -> None:
+        _required("client_id", self.client_id)
+        _sha256("update_hash", self.update_hash)
+        object.__setattr__(self, "weight", _binary64("weight", self.weight))
+        if self.weight <= 0:
+            raise ValueError("contributor weight must be positive")
+
+
+def contributor_merkle_root(leaves: tuple[ContributorLeaf, ...]) -> str:
+    """Bind a canonical client/update/weight set without exposing model bytes."""
+    leaves = tuple(leaves)
+    if not leaves:
+        raise ValueError("contributor set must be non-empty")
+    if any(not isinstance(leaf, ContributorLeaf) for leaf in leaves):
+        raise TypeError("contributor leaves must be ContributorLeaf objects")
+    ordered = tuple(sorted(leaves, key=lambda leaf: leaf.client_id))
+    if ordered != leaves or len({leaf.client_id for leaf in leaves}) != len(leaves):
+        raise ValueError("contributor leaves must have distinct ascending client IDs")
+    return merkle_root(
+        [
+            {"domain": "fedmerit-contributor-leaf-v1", "leaf": leaf}
+            for leaf in leaves
+        ]
+    )
+
+
+@dataclass(frozen=True)
 class RiskAllocation:
     epsilon: float
     gamma: float
@@ -312,13 +379,14 @@ class RiskSchedule:
 
 @dataclass(frozen=True)
 class SourcePartition:
-    """Complete proposal-source exclusion manifest registered by the authority."""
+    """Authority-registered proposal/score exclusion inventory."""
 
     context_hash: str
     contributor_root: str
     score_probe_commitment: str
     policy_hash: str
     source_manifest_hashes: tuple[str, ...]
+    score_source_manifest_hashes: tuple[str, ...]
 
     def __post_init__(self) -> None:
         for name in (
@@ -328,20 +396,31 @@ class SourcePartition:
             "policy_hash",
         ):
             _sha256(name, getattr(self, name))
-        manifests = tuple(self.source_manifest_hashes)
-        object.__setattr__(self, "source_manifest_hashes", manifests)
-        if not manifests:
-            raise ValueError("source partition must contain proposal-source manifests")
-        if manifests != tuple(sorted(manifests)):
-            raise ValueError("source manifests must use canonical ascending order")
-        if len(set(manifests)) != len(manifests):
-            raise ValueError("source manifests must be distinct")
-        for item in manifests:
-            _sha256("source_manifest_hash", item)
+        proposal = tuple(self.source_manifest_hashes)
+        score = tuple(self.score_source_manifest_hashes)
+        object.__setattr__(self, "source_manifest_hashes", proposal)
+        object.__setattr__(self, "score_source_manifest_hashes", score)
+        for name, manifests in (("proposal", proposal), ("score", score)):
+            if not manifests:
+                raise ValueError(f"source partition must contain {name}-source manifests")
+            if manifests != tuple(sorted(manifests)):
+                raise ValueError(
+                    f"{name} source manifests must use canonical ascending order"
+                )
+            if len(set(manifests)) != len(manifests):
+                raise ValueError(f"{name} source manifests must be distinct")
+            for item in manifests:
+                _sha256(f"{name}_source_manifest_hash", item)
+        if set(proposal).intersection(score):
+            raise ValueError("proposal and score source manifests must be disjoint")
 
     @property
     def partition_hash(self) -> str:
         return digest(self)
+
+    @property
+    def all_source_manifest_hashes(self) -> tuple[str, ...]:
+        return tuple(sorted(self.source_manifest_hashes + self.score_source_manifest_hashes))
 
 
 @dataclass(frozen=True)
@@ -373,6 +452,65 @@ class SamplingFrameEntry:
 
 
 @dataclass(frozen=True)
+class SamplingFrameCommitment:
+    """Signed public frame header; payload leaves remain behind the Merkle root."""
+
+    frame_id: str
+    context_hash: str
+    policy_hash: str
+    catalog_root: str
+    catalog_id_hashes: tuple[str, ...]
+    group_count: int
+    beacon_id: str
+    beacon_public_key_hash: str
+    source_partition_hashes: tuple[str, ...]
+    exclusion_source_manifest_hashes: tuple[str, ...]
+    selection_policy: str
+    beacon_checkpoint_round: int
+    beacon_checkpoint_hash: str
+
+    def __post_init__(self) -> None:
+        _required("frame_id", self.frame_id)
+        _required("beacon_id", self.beacon_id)
+        for name in (
+            "context_hash",
+            "policy_hash",
+            "catalog_root",
+            "beacon_public_key_hash",
+            "beacon_checkpoint_hash",
+        ):
+            _sha256(name, getattr(self, name))
+        _uint32("group_count", self.group_count)
+        _uint32("beacon_checkpoint_round", self.beacon_checkpoint_round)
+        if self.group_count == 0:
+            raise ValueError("sampling-frame group count must be positive")
+        if self.selection_policy != "beacon-sha256-rejection-sampling-v1":
+            raise ValueError("unsupported sampling-frame selection policy")
+        for field_name in (
+            "catalog_id_hashes",
+            "source_partition_hashes",
+            "exclusion_source_manifest_hashes",
+        ):
+            values = tuple(getattr(self, field_name))
+            object.__setattr__(self, field_name, values)
+            if values != tuple(sorted(values)) or len(values) != len(set(values)):
+                raise ValueError(f"{field_name} must be distinct and ascending")
+            if field_name != "exclusion_source_manifest_hashes" and not values:
+                raise ValueError(f"{field_name} must be non-empty")
+            for value in values:
+                _sha256(field_name, value)
+
+    @property
+    def frame_hash(self) -> str:
+        return digest(
+            {
+                "domain": "fedmerit-sealed-catalog-frame-v4",
+                "commitment": self,
+            }
+        )
+
+
+@dataclass(frozen=True)
 class SamplingFrame:
     """Signed sealed catalog whose leaves disclose no raw probe payload."""
 
@@ -382,6 +520,9 @@ class SamplingFrame:
     entries: tuple[SamplingFrameEntry, ...]
     beacon_id: str
     beacon_public_key_hash: str
+    source_partition_hashes: tuple[str, ...]
+    beacon_checkpoint_round: int
+    beacon_checkpoint_hash: str
     exclusion_source_manifest_hashes: tuple[str, ...] = ()
     selection_policy: str = "beacon-sha256-rejection-sampling-v1"
 
@@ -391,14 +532,18 @@ class SamplingFrame:
         _sha256("context_hash", self.context_hash)
         _sha256("policy_hash", self.policy_hash)
         _sha256("beacon_public_key_hash", self.beacon_public_key_hash)
+        _uint32("beacon_checkpoint_round", self.beacon_checkpoint_round)
+        _sha256("beacon_checkpoint_hash", self.beacon_checkpoint_hash)
         if self.selection_policy != "beacon-sha256-rejection-sampling-v1":
             raise ValueError("unsupported sampling-frame selection policy")
         entries = tuple(self.entries)
         if any(not isinstance(entry, SamplingFrameEntry) for entry in entries):
             raise TypeError("sampling-frame entries must be SamplingFrameEntry objects")
         exclusions = tuple(self.exclusion_source_manifest_hashes)
+        partitions = tuple(self.source_partition_hashes)
         object.__setattr__(self, "entries", entries)
         object.__setattr__(self, "exclusion_source_manifest_hashes", exclusions)
+        object.__setattr__(self, "source_partition_hashes", partitions)
         ids = tuple(entry.probe_id_hash for entry in entries)
         if not ids or ids != tuple(sorted(ids)) or len(ids) != len(set(ids)):
             raise ValueError("sampling-frame entries must have distinct ascending IDs")
@@ -419,6 +564,16 @@ class SamplingFrame:
             raise ValueError("sampling-frame exclusions must be distinct and ascending")
         for item in exclusions:
             _sha256("excluded_source_manifest_hash", item)
+        if (
+            not partitions
+            or partitions != tuple(sorted(partitions))
+            or len(partitions) != len(set(partitions))
+        ):
+            raise ValueError(
+                "sampling-frame source partitions must be non-empty, distinct, and ascending"
+            )
+        for item in partitions:
+            _sha256("source_partition_hash", item)
 
     @property
     def catalog_root(self) -> str:
@@ -430,14 +585,42 @@ class SamplingFrame:
         )
 
     @property
-    def frame_hash(self) -> str:
-        return digest(
-            {
-                "domain": "fedmerit-sealed-catalog-frame-v3",
-                "catalog_root": self.catalog_root,
-                "frame": self,
-            }
+    def public_commitment(self) -> SamplingFrameCommitment:
+        return SamplingFrameCommitment(
+            frame_id=self.frame_id,
+            context_hash=self.context_hash,
+            policy_hash=self.policy_hash,
+            catalog_root=self.catalog_root,
+            catalog_id_hashes=tuple(entry.probe_id_hash for entry in self.entries),
+            group_count=self.entries[0].group_count,
+            beacon_id=self.beacon_id,
+            beacon_public_key_hash=self.beacon_public_key_hash,
+            source_partition_hashes=self.source_partition_hashes,
+            exclusion_source_manifest_hashes=self.exclusion_source_manifest_hashes,
+            selection_policy=self.selection_policy,
+            beacon_checkpoint_round=self.beacon_checkpoint_round,
+            beacon_checkpoint_hash=self.beacon_checkpoint_hash,
         )
+
+    @property
+    def frame_hash(self) -> str:
+        return self.public_commitment.frame_hash
+
+
+@dataclass(frozen=True)
+class SignedSamplingFrameCommitment:
+    """Authority-signed public frame header used by public verifiers."""
+
+    commitment: SamplingFrameCommitment
+    signature: bytes
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.signature, (bytes, bytearray)):
+            raise TypeError("sampling-frame signature must be bytes")
+        signature = bytes(self.signature)
+        object.__setattr__(self, "signature", signature)
+        if len(signature) != 64:
+            raise ValueError("sampling-frame Ed25519 signature must be 64 bytes")
 
 
 @dataclass(frozen=True)
@@ -454,6 +637,10 @@ class SignedSamplingFrame:
         object.__setattr__(self, "signature", signature)
         if len(signature) != 64:
             raise ValueError("sampling-frame Ed25519 signature must be 64 bytes")
+
+    @property
+    def public_commitment(self) -> SignedSamplingFrameCommitment:
+        return SignedSamplingFrameCommitment(self.frame.public_commitment, self.signature)
 
 
 @dataclass(frozen=True)
@@ -499,7 +686,13 @@ class SignedBeaconRound:
 
 @dataclass(frozen=True)
 class Candidate:
-    """Candidate fixation. Every risk/probe field is fixed before release."""
+    """Candidate fixation with one policy bound at context and probe positions.
+
+    ``context_policy_hash`` and ``probe_policy_hash`` intentionally expose the
+    same registered ``EvaluationPolicy`` digest. Keeping both binding positions
+    prevents a verifier from omitting either the live-context or released-probe
+    comparison without pretending that two independent policies exist.
+    """
 
     context_hash: str
     state_context: StateContext
@@ -545,6 +738,8 @@ class Candidate:
             raise ValueError(
                 "candidate eligible probe IDs must be distinct and ascending"
             )
+        if len(eligible_ids) > self.evaluation_policy.security_profile.max_catalog_leaves:
+            raise ValueError("candidate eligible set exceeds the registered security cap")
         for probe_id_hash in eligible_ids:
             _sha256("eligible_probe_id_hash", probe_id_hash)
         if self.state_context.context_hash != self.context_hash:
@@ -597,7 +792,7 @@ class Candidate:
 
     @property
     def excluded_source_manifests(self) -> tuple[str, ...]:
-        return self.source_partition.source_manifest_hashes
+        return self.source_partition.all_source_manifest_hashes
 
     @property
     def fixation_hash(self) -> str:

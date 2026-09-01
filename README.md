@@ -51,13 +51,14 @@ spending, exclusive successor-round reservation, and crash-atomic installation.
 ## Evidence producer
 
 ```bash
-python3 scripts/produce_evidence.py --output output
+python3 -m scripts.produce_evidence --output output
 ```
 
-The producer writes 44 exact calculation and conformance records, aggregate
+The producer writes 46 exact calculation and conformance records, aggregate
 metrics, a known-answer receipt, and a SHA-256 manifest. It rejects a receipt
-that differs from `artifacts/reference_receipt.json`. Generated result
-directories are not part of the source distribution.
+that differs from `artifacts/reference_receipt.json`. Generated conformance
+directories are not part of the source distribution; the retained UR3 benchmark
+release under `results/ur3/` is the checked-in exception used by the manuscript.
 
 ## Paper chart
 
@@ -66,7 +67,7 @@ render the protocol-scaling chart:
 
 ```bash
 python3 -m pip install -r requirements-figures.txt
-python3 scripts/produce_evidence.py --output results_devready
+python3 -m scripts.produce_evidence --output results_devready
 python3 figures/plot_protocol_scaling.py \
   --evidence results_devready/metrics.json
 ```
@@ -94,21 +95,43 @@ initialization, and applies the same exact-byte comparison to the first commit.
 `VerificationTrust.authority_certificate_hash` binds the roster epoch, fault
 threshold, witness keys, probe-store key, and frame-authority key to the live
 context; changing any field requires an explicitly certified successor context.
-Catalog completeness, source
-representativeness, authority validity, and authority/proposer
-non-collusion are deployment conditions. Beacon validity additionally requires
-an unpredictable, unbiasable threshold source and a complete finality watcher;
-the ledger authenticates the monotonic parent chain and uniquely reserves each
-successor round for one fixation. A handover is an immediate successor
+The frame-authority signature binds the exact proposal/score source partitions;
+the store rejects overlap between those manifests and every released commit
+group. Catalog completeness, source representativeness, authority validity, and
+authority/proposer non-collusion remain deployment conditions. Beacon validity
+additionally requires an unpredictable, unbiasable threshold source and a
+complete finality watcher; the audit registry owns the authoritative monotonic
+head and successor reservations shared by every local risk-ledger replica. A
+handover is an immediate successor
 of the live context: it preserves the twin identity, increments the state
 version by one, and may change domain, schema, authority, or evaluation policy
 while retaining the installed model version. The registry rejects rollback,
 skipped epochs, and successors whose model version differs from the installed
 artifact.
 
-For deployments that need a probability bound across handovers,
-`AuditRegistry.provision_lineage_risk_budget()` freezes one envelope for the
-invariant twin identity before any context schedule is registered. Every later
-context schedule is charged against the same exact binary64 budget, so a domain
-handover cannot reset the available risk. Without this explicit envelope, the
-implementation intentionally makes only the per-context schedule claim.
+`AuditRegistry.provision_lineage_risk_budget()` is mandatory and freezes one
+envelope for the invariant twin identity before any context schedule is
+registered. Every later context schedule is charged against the same exact
+binary64 budget, so a domain handover cannot reset the available risk; schedule
+registration fails closed when the envelope is absent.
+
+## Reproducible workload benchmark
+
+`scripts/run_ur3_benchmark.py` is an optional experiment driver for the UCI
+UR3 CobotOps workbook (DOI `10.24432/C5J891`). It treats operation cycles as
+non-IID groups and keeps proposal, score, commit, and audit groups disjoint.
+The driver compares FedAvg, coordinate median, Krum, FLTrust, FedVal, and the
+cluster-representative FLShield path under sign-flip and model-replacement
+attacks. Every proposal is evaluated twice: once as an unguarded installation
+and once through the exact Decimal80 FedMERIT paired replay. It writes raw
+per-seed records, 95% confidence intervals, and split metadata; it does not
+replace the cryptographic conformance suite.
+
+The workload requires the optional dependencies in
+`requirements-experiments.txt` and should be run on a GPU/CI worker rather
+than during a local source checkout. The checked-in manuscript reports only
+results whose raw CSV and metadata are retained with the release.
+
+The `AuditRegistry` also records each accepted protocol transition in an
+append-only, hash-linked `protocol_events` journal. Update and delete triggers
+fail closed; `protocol_event_chain_valid()` is intended for recovery checks.

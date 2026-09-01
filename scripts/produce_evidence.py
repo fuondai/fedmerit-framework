@@ -45,6 +45,7 @@ from fedmerit.model import (
     RECEIPT_CORE_BYTES,
     Candidate,
     CommitProbe,
+    ContributorLeaf,
     EvaluationPolicy,
     LinearModelArtifact,
     ProbeGroup,
@@ -52,9 +53,11 @@ from fedmerit.model import (
     RiskAllocation,
     RiskSchedule,
     SamplingFrame,
+    SecurityProfile,
     SourcePartition,
     StateContext,
     ZERO_HASH,
+    contributor_merkle_root,
 )
 
 
@@ -65,6 +68,7 @@ PROTOCOL_CONFIG = read_json_object(CONFIG)
 validate_manifest(PROTOCOL_CONFIG)
 
 _policy_fields = PROTOCOL_CONFIG["evaluation_policy"]
+_security_fields = _policy_fields["security_profile"]
 EVALUATION_POLICY = EvaluationPolicy(
     policy_id=_policy_fields["policy_id"],
     loss=_policy_fields["loss"],
@@ -76,6 +80,7 @@ EVALUATION_POLICY = EvaluationPolicy(
     missing_value_rule=_policy_fields["missing_value_rule"],
     class_weights=tuple(_policy_fields["class_weights"]),
     group_reduction=_policy_fields["group_reduction"],
+    security_profile=SecurityProfile(**_security_fields),
 )
 RISK_GRID = tuple(
     (item["alpha"], item["epsilon"], item["gamma"])
@@ -255,6 +260,34 @@ def _protocol_case(
     beacon_round_number = 1_000 + int(
         hashlib.sha256(f"{name}:beacon-round".encode()).hexdigest()[:6], 16
     )
+    signed_beacon_head = sign_beacon_round(
+        BeaconRound(
+            beacon_id,
+            beacon_round_number - 1,
+            hashlib.sha256(f"{name}:beacon-grandparent".encode()).hexdigest(),
+            hashlib.sha256(f"{name}:authenticated-beacon-head".encode()).digest(),
+        ),
+        beacon_private_key,
+    )
+    contributor_root = contributor_merkle_root(
+        tuple(
+            ContributorLeaf(
+                f"client-{index:03d}",
+                hashlib.sha256(f"{name}:update:{index}".encode()).hexdigest(),
+                0.25,
+            )
+            for index in range(4)
+        )
+    )
+    score_commitment = hashlib.sha256(f"{name}:score".encode()).hexdigest()
+    partition = SourcePartition(
+        context.context_hash,
+        contributor_root,
+        score_commitment,
+        policy.policy_hash,
+        (hashlib.sha256(f"{name}:proposal-source".encode()).hexdigest(),),
+        (hashlib.sha256(f"{name}:score-source".encode()).hexdigest(),),
+    )
     frame = SamplingFrame(
         f"frame-{name}",
         context.context_hash,
@@ -266,29 +299,14 @@ def _protocol_case(
         ),
         beacon_id,
         hashlib.sha256(beacon_public_key_bytes).hexdigest(),
+        (partition.partition_hash,),
+        beacon_checkpoint_round=signed_beacon_head.round.round_number,
+        beacon_checkpoint_hash=signed_beacon_head.round.round_hash,
     )
     signed_frame = sign_sampling_frame(frame, frame_private_key)
-    contributor_root = hashlib.sha256(f"{name}:contributors".encode()).hexdigest()
-    score_commitment = hashlib.sha256(f"{name}:score".encode()).hexdigest()
-    partition = SourcePartition(
-        context.context_hash,
-        contributor_root,
-        score_commitment,
-        policy.policy_hash,
-        (hashlib.sha256(f"{name}:proposal-source".encode()).hexdigest(),),
-    )
     allocation = RiskAllocation(epsilon, gamma, alpha, group_count)
     schedule = RiskSchedule(
         f"schedule-{name}", context.context_hash, ZERO_HASH, alpha, (allocation,)
-    )
-    signed_beacon_head = sign_beacon_round(
-        BeaconRound(
-            beacon_id,
-            beacon_round_number - 1,
-            hashlib.sha256(f"{name}:beacon-grandparent".encode()).hexdigest(),
-            hashlib.sha256(f"{name}:authenticated-beacon-head".encode()).digest(),
-        ),
-        beacon_private_key,
     )
     candidate = Candidate(
         context.context_hash,
@@ -315,10 +333,12 @@ def _protocol_case(
         evaluation_policy=policy,
         verification_trust=trust,
     )
+    registry.provision_lineage_risk_budget(0.9999)
     ledger = RiskLedger(root / "risk.sqlite3")
     ledger.register(schedule, audit_registry=registry)
     ledger.observe_beacon_head(
         signed_beacon_head,
+        audit_registry=registry,
         beacon_public_key=beacon_private_key.public_key(),
         signed_frame=signed_frame,
         frame_public_key=frame_private_key.public_key(),
@@ -326,6 +346,7 @@ def _protocol_case(
     ledger.consume(
         candidate,
         schedule,
+        audit_registry=registry,
         beacon_public_key=beacon_private_key.public_key(),
         signed_frame=signed_frame,
         frame_public_key=frame_private_key.public_key(),
@@ -765,16 +786,18 @@ def _integrity_rows() -> list[dict[str, Any]]:
         late_fixation_rejected = False
         late_ledger = RiskLedger(Path(directory) / "late-risk.sqlite3")
         late_ledger.register(case["schedule"], audit_registry=case["registry"])
-        late_ledger.observe_beacon_head(
-            case["signed_beacon_round"],
-            beacon_public_key=case["beacon_private_key"].public_key(),
-            signed_frame=case["signed_frame"],
-            frame_public_key=case["frame_private_key"].public_key(),
-        )
         try:
+            late_ledger.observe_beacon_head(
+                case["signed_beacon_round"],
+                audit_registry=case["registry"],
+                beacon_public_key=case["beacon_private_key"].public_key(),
+                signed_frame=case["signed_frame"],
+                frame_public_key=case["frame_private_key"].public_key(),
+            )
             late_ledger.consume(
                 case["candidate"],
                 case["schedule"],
+                audit_registry=case["registry"],
                 beacon_public_key=case["beacon_private_key"].public_key(),
                 signed_frame=case["signed_frame"],
                 frame_public_key=case["frame_private_key"].public_key(),
@@ -786,6 +809,7 @@ def _integrity_rows() -> list[dict[str, Any]]:
         try:
             restarted_late_ledger.observe_beacon_head(
                 case["signed_beacon_head"],
+                audit_registry=case["registry"],
                 beacon_public_key=case["beacon_private_key"].public_key(),
                 signed_frame=case["signed_frame"],
                 frame_public_key=case["frame_private_key"].public_key(),
@@ -856,6 +880,36 @@ def _integrity_rows() -> list[dict[str, Any]]:
                     "passed": (
                         case["candidate"].score_probe_commitment
                         != release.commit_probe_commitment
+                    ),
+                },
+                {
+                    "kind": "integrity_check",
+                    "check": "signed_source_partition_inventory_verified",
+                    "passed": (
+                        case["frame"].source_partition_hashes
+                        == (case["partition"].partition_hash,)
+                        and not set(
+                            case["partition"].source_manifest_hashes
+                        ).intersection(
+                            case["partition"].score_source_manifest_hashes
+                        )
+                    ),
+                },
+                {
+                    "kind": "integrity_check",
+                    "check": "public_release_uses_merkle_membership_path",
+                    "passed": (
+                        verify_public_release(
+                            release.public_release,
+                            case["candidate"],
+                            case["store"].public_key,
+                            case["frame_private_key"].public_key(),
+                        )
+                        and not hasattr(
+                            release.public_release.signed_sampling_frame.commitment,
+                            "entries",
+                        )
+                        and bool(release.public_release.catalog_membership_path)
                     ),
                 },
                 {
