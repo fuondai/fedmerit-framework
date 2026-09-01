@@ -265,6 +265,13 @@ class RiskLedger:
                     beacon_public_key_hash TEXT PRIMARY KEY, beacon_id TEXT NOT NULL,
                     round_number INTEGER NOT NULL, round_hash TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS beacon_successor_reservations(
+                    beacon_public_key_hash TEXT NOT NULL,
+                    round_number INTEGER NOT NULL,
+                    parent_round_hash TEXT NOT NULL,
+                    fixation_hash TEXT UNIQUE NOT NULL,
+                    PRIMARY KEY(beacon_public_key_hash, round_number)
+                );
                 CREATE TABLE IF NOT EXISTS source_manifest_ledger(
                     source_manifest_hash TEXT PRIMARY KEY,
                     context_hash TEXT NOT NULL,
@@ -488,6 +495,37 @@ class RiskLedger:
                         )
                     return
                 raise ValueError("risk schedule allocation has already been spent")
+            reservation = db.execute(
+                "SELECT parent_round_hash, fixation_hash "
+                "FROM beacon_successor_reservations "
+                "WHERE beacon_public_key_hash=? AND round_number=?",
+                (beacon_key_hash, candidate.beacon_round),
+            ).fetchone()
+            expected_reservation = (
+                candidate.beacon_parent_hash,
+                candidate.fixation_hash,
+            )
+            if reservation is None:
+                try:
+                    db.execute(
+                        "INSERT INTO beacon_successor_reservations VALUES(?,?,?,?)",
+                        (
+                            beacon_key_hash,
+                            candidate.beacon_round,
+                            candidate.beacon_parent_hash,
+                            candidate.fixation_hash,
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    db.rollback()
+                    raise ValueError(
+                        "beacon successor is already reserved by another fixation"
+                    ) from exc
+            elif (str(reservation[0]), str(reservation[1])) != expected_reservation:
+                db.rollback()
+                raise ValueError(
+                    "beacon successor is already reserved by another fixation"
+                )
             db.execute(
                 "UPDATE allocations SET fixation_hash=?, beacon_parent_round=?, "
                 "beacon_parent_hash=? "

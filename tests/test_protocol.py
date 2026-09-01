@@ -89,11 +89,11 @@ class SealedCatalogConformanceTests(unittest.TestCase):
     def test_cross_handover_risk_budget_is_registered(self) -> None:
         self.assertTrue(self.result["cross_handover_risk_budget_registered"])
 
-    def test_append_rejects_mismatched_installed_artifact(self) -> None:
-        with TemporaryDirectory(prefix="fedmerit-install-readback-") as directory:
+    def test_install_and_append_rolls_back_serving_bytes_on_audit_failure(self) -> None:
+        with TemporaryDirectory(prefix="fedmerit-install-atomic-") as directory:
             case = _protocol_case(
                 Path(directory),
-                name="readback-mismatch",
+                name="atomic-install",
                 after_bias=2.0,
                 epsilon=0.10,
                 gamma=0.05,
@@ -116,7 +116,33 @@ class SealedCatalogConformanceTests(unittest.TestCase):
                 risk_ledger=case["ledger"],
                 audit_registry=case["registry"],
             )
-            self.assertFalse(
+            self.assertEqual(receipt.core.decision, "commit")
+            before = case["registry"].serving_model_snapshot
+            with sqlite3.connect(case["registry"].path) as db:
+                db.executescript("""
+                    CREATE TRIGGER fail_audit_head_update
+                    BEFORE UPDATE OF head ON audit_state
+                    BEGIN
+                        SELECT RAISE(ABORT, 'injected audit failure');
+                    END;
+                """)
+            appended = case["registry"].verify_and_append(
+                receipt,
+                case["authority"].public_keys,
+                f=1,
+                release=release,
+                candidate=case["candidate"],
+                store_public_key=case["store"].public_key,
+                frame_public_key=case["frame_private_key"].public_key(),
+                schedule=case["schedule"],
+                risk_ledger=case["ledger"],
+            )
+            self.assertFalse(appended)
+            self.assertEqual(case["registry"].head, ZERO_HASH)
+            self.assertEqual(case["registry"].serving_model_snapshot, before)
+            with sqlite3.connect(case["registry"].path) as db:
+                db.execute("DROP TRIGGER fail_audit_head_update")
+            self.assertTrue(
                 case["registry"].verify_and_append(
                     receipt,
                     case["authority"].public_keys,
@@ -127,10 +153,16 @@ class SealedCatalogConformanceTests(unittest.TestCase):
                     frame_public_key=case["frame_private_key"].public_key(),
                     schedule=case["schedule"],
                     risk_ledger=case["ledger"],
-                    installed_model=LinearModelArtifact((0.0, 3.0)),
                 )
             )
-            self.assertEqual(case["registry"].head, ZERO_HASH)
+            installed_hash, installed_version, installed_blob = (
+                case["registry"].serving_model_snapshot
+            )
+            self.assertEqual(installed_hash, case["candidate"].after_model_hash)
+            self.assertEqual(
+                installed_version, case["candidate"].state_context.model_version + 1
+            )
+            self.assertEqual(installed_blob, canonical_bytes(case["candidate"].after_model))
 
     def test_catalog_reassignment_is_rejected(self) -> None:
         self.assertTrue(self.result["catalog_reassignment_rejected"])
@@ -155,6 +187,45 @@ class SealedCatalogConformanceTests(unittest.TestCase):
 
     def test_beacon_head_cannot_skip_or_fork_the_parent_chain(self) -> None:
         self.assertTrue(self.result["skipped_or_forked_beacon_round_rejected"])
+
+    def test_one_successor_round_cannot_fund_two_fixations(self) -> None:
+        with TemporaryDirectory(prefix="fedmerit-beacon-reservation-") as directory:
+            case = _protocol_case(
+                Path(directory),
+                name="exclusive-beacon-successor",
+                after_bias=2.0,
+                epsilon=0.10,
+                gamma=0.05,
+                alpha=0.10,
+            )
+            raw_key = case["beacon_private_key"].public_key().public_bytes(
+                serialization.Encoding.Raw, serialization.PublicFormat.Raw
+            )
+            key_hash = hashlib.sha256(raw_key).hexdigest()
+            with sqlite3.connect(case["ledger"].path) as db:
+                reservation = db.execute(
+                    "SELECT parent_round_hash, fixation_hash "
+                    "FROM beacon_successor_reservations "
+                    "WHERE beacon_public_key_hash=? AND round_number=?",
+                    (key_hash, case["candidate"].beacon_round),
+                ).fetchone()
+                self.assertEqual(
+                    reservation,
+                    (
+                        case["candidate"].beacon_parent_hash,
+                        case["candidate"].fixation_hash,
+                    ),
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    db.execute(
+                        "INSERT INTO beacon_successor_reservations VALUES(?,?,?,?)",
+                        (
+                            key_hash,
+                            case["candidate"].beacon_round,
+                            case["candidate"].beacon_parent_hash,
+                            _digest("conflicting-fixation"),
+                        ),
+                    )
 
     def test_public_and_authorized_paths_are_distinct(self) -> None:
         self.assertTrue(self.result["public_receipt_verified_without_raw_probe"])
@@ -853,7 +924,6 @@ class ModelSuccessorTests(unittest.TestCase):
                     frame_public_key=case["frame_private_key"].public_key(),
                     schedule=case["schedule"],
                     risk_ledger=case["ledger"],
-                    installed_model=case["candidate"].after_model,
                 )
             )
             self.assertEqual(reopened.head, head_before_retry)
@@ -1040,7 +1110,6 @@ class ModelSuccessorTests(unittest.TestCase):
                     frame_public_key=first["frame_private_key"].public_key(),
                     schedule=schedule,
                     risk_ledger=ledger,
-                    installed_model=candidate.after_model,
                 )
             )
             self.assertEqual(

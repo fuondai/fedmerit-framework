@@ -29,7 +29,6 @@ from .canonical import canonical_bytes
 from .model import (
     Candidate,
     EvaluationPolicy,
-    LinearModelArtifact,
     Receipt,
     ReceiptCore,
     RiskSchedule,
@@ -568,6 +567,12 @@ class AuditRegistry:
                     installed_model_hash TEXT NOT NULL, genesis_model_hash TEXT NOT NULL,
                     installed_model_version INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS serving_model(
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    model_hash TEXT NOT NULL,
+                    model_version INTEGER NOT NULL,
+                    artifact_blob BLOB
+                );
                 CREATE TABLE IF NOT EXISTS context_head(
                     id INTEGER PRIMARY KEY CHECK(id=1),
                     context_hash TEXT NOT NULL,
@@ -684,6 +689,24 @@ class AuditRegistry:
                 raise ValueError(
                     "audit registry was initialized for another genesis model"
                 )
+            audit_model = db.execute(
+                "SELECT installed_model_hash, installed_model_version "
+                "FROM audit_state WHERE id=1"
+            ).fetchone()
+            serving_model = db.execute(
+                "SELECT model_hash, model_version FROM serving_model WHERE id=1"
+            ).fetchone()
+            expected_serving = (str(audit_model[0]), int(audit_model[1]))
+            if serving_model is None:
+                db.execute(
+                    "INSERT INTO serving_model "
+                    "(id, model_hash, model_version, artifact_blob) VALUES(1,?,?,NULL)",
+                    expected_serving,
+                )
+            elif (str(serving_model[0]), int(serving_model[1])) != expected_serving:
+                raise ValueError(
+                    "serving model and authenticated audit state disagree"
+                )
             context_row = db.execute(
                 "SELECT context_hash, authority_certificate_hash, policy_hash, "
                 "twin_id, state_version, model_version FROM context_head WHERE id=1"
@@ -779,6 +802,19 @@ class AuditRegistry:
                     "SELECT installed_model_version FROM audit_state WHERE id=1"
                 ).fetchone()[0]
             )
+
+    @property
+    def serving_model_snapshot(self) -> tuple[str, int, bytes | None]:
+        """Return the model atomically installed with the authenticated head."""
+        with closing(self._connect()) as db:
+            row = db.execute(
+                "SELECT model_hash, model_version, artifact_blob "
+                "FROM serving_model WHERE id=1"
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("serving model is not initialized")
+        blob = None if row[2] is None else bytes(row[2])
+        return str(row[0]), int(row[1]), blob
 
     @staticmethod
     def _provision_trust_locked(
@@ -1507,6 +1543,21 @@ class AuditRegistry:
             if candidate.state_context.model_version != int(installed_version):
                 db.rollback()
                 raise ValueError("receipt model version differs from installed state")
+            serving = db.execute(
+                "SELECT model_hash, model_version, artifact_blob "
+                "FROM serving_model WHERE id=1"
+            ).fetchone()
+            before_blob = canonical_bytes(candidate.before_model)
+            if (
+                serving is None
+                or str(serving[0]) != installed
+                or int(serving[1]) != int(installed_version)
+                or (serving[2] is not None and bytes(serving[2]) != before_blob)
+            ):
+                db.rollback()
+                raise ValueError(
+                    "serving artifact differs from the authenticated before-model"
+                )
             successor_context = None
             inherited_trust = None
             if core.decision == "commit":
@@ -1578,6 +1629,25 @@ class AuditRegistry:
             installed_version_next = int(installed_version) + (
                 1 if core.decision == "commit" else 0
             )
+            serving_blob_next = (
+                canonical_bytes(candidate.after_model)
+                if core.decision == "commit"
+                else before_blob
+            )
+            updated_serving = db.execute(
+                "UPDATE serving_model SET model_hash=?, model_version=?, "
+                "artifact_blob=? WHERE id=1 AND model_hash=? AND model_version=?",
+                (
+                    installed_next,
+                    installed_version_next,
+                    serving_blob_next,
+                    installed,
+                    installed_version,
+                ),
+            ).rowcount
+            if updated_serving != 1:
+                db.rollback()
+                raise ValueError("serving-model compare-and-swap lost a concurrent race")
             if successor_context is not None:
                 db.execute(
                     "INSERT OR IGNORE INTO registered_contexts VALUES(?,?)",
@@ -1625,26 +1695,15 @@ class AuditRegistry:
         frame_public_key: Ed25519PublicKey,
         schedule: RiskSchedule,
         risk_ledger: RiskLedger,
-        installed_model: LinearModelArtifact | None = None,
     ) -> bool:
-        """Verify a receipt and append it only after a model read-back check.
+        """Verify, install, and append at one SQLite linearization point.
 
-        The deployment adapter supplies the artifact read back from its serving
-        store after staging the transition.  Comparing its canonical artifact
-        hash with the receipt's expected post-decision model prevents this
-        registry from recording a receipt for bytes that were never installed
-        (or for a different artifact with the same model version).
+        The registry is the authoritative serving store for the reference
+        implementation.  Its model bytes, model version, context head, receipt
+        head, and receipt row change in the same transaction.  External serving
+        systems must provide an adapter with equivalent compare-and-swap and
+        crash-atomic semantics rather than supplying an unauthenticated read-back.
         """
-        expected_model = (
-            candidate.after_model
-            if receipt.core.decision == "commit"
-            else candidate.before_model
-        )
-        if (
-            installed_model is None
-            or installed_model.artifact_hash != expected_model.artifact_hash
-        ):
-            return False
         if not verify_receipt(
             receipt,
             public_keys,
@@ -1668,6 +1727,6 @@ class AuditRegistry:
                 ),
                 probe_id_hash=release.probe.probe_id_hash,
             )
-        except ValueError:
+        except (ValueError, sqlite3.Error):
             return False
         return True

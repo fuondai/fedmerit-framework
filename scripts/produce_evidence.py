@@ -387,11 +387,6 @@ def _execute(case: dict[str, Any]) -> tuple[Any, Receipt, bool]:
         frame_public_key=case["frame_private_key"].public_key(),
         schedule=case["schedule"],
         risk_ledger=case["ledger"],
-        installed_model=(
-            case["candidate"].after_model
-            if receipt.core.decision == "commit"
-            else case["candidate"].before_model
-        ),
     )
     return release, receipt, appended
 
@@ -558,11 +553,6 @@ def _handover_rows() -> list[dict[str, Any]]:
                     frame_public_key=case["frame_private_key"].public_key(),
                     schedule=case["schedule"],
                     risk_ledger=case["ledger"],
-                    installed_model=(
-                        case["candidate"].after_model
-                        if receipt.core.decision == "commit"
-                        else case["candidate"].before_model
-                    ),
                 )
             if position == "after_append":
                 handover_now()
@@ -1000,7 +990,6 @@ def _integrity_rows() -> list[dict[str, Any]]:
             frame_public_key=case["frame_private_key"].public_key(),
             schedule=case["schedule"],
             risk_ledger=case["ledger"],
-            installed_model=case["candidate"].after_model,
         )
         appended_head = case["registry"].head
         appended_model = case["registry"].installed_model_hash
@@ -1027,7 +1016,6 @@ def _integrity_rows() -> list[dict[str, Any]]:
             frame_public_key=case["frame_private_key"].public_key(),
             schedule=case["schedule"],
             risk_ledger=case["ledger"],
-            installed_model=case["candidate"].after_model,
         )
         rows.append(
             {

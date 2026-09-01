@@ -6,9 +6,11 @@ quorum issuance, one-use release, receipt verification, and an atomic
 `CheckAppend` boundary backed by SQLite.
 
 Catalog entries expose only opaque salted SHA-256 identifiers and payload
-commitments. The selected `ProbeRelease` reveals the 256-bit salt and raw opening
-only to authorized replayers; the public release never carries collection-window,
-source-handle, row, or salt metadata.
+commitments. The protocol's statistical-to-cryptographic reduction registers
+SHA-256 as a random oracle for transcript IND-hiding; preimage resistance alone
+is not treated as a hiding argument. The selected `ProbeRelease` reveals the
+256-bit salt and raw opening only to authorized replayers; the public release
+never carries collection-window, source-handle, row, or salt metadata.
 
 ## Environment
 
@@ -44,7 +46,7 @@ python3 -m pytest -q
 ```
 
 The suite covers the wire encoder, replay rules, handover fencing, risk-budget
-spending, and the installed-artifact read-back boundary.
+spending, exclusive successor-round reservation, and crash-atomic installation.
 
 ## Evidence producer
 
@@ -80,13 +82,18 @@ evidence directory; the implementation-level checks still run.
 
 Public receipt verification checks state, catalog, beacon, risk, and quorum
 bindings without revealing raw groups. Authorized verification additionally
-opens the selected payload and replays the paired gate. `verify_and_append`
-also requires the deployment adapter to pass the model artifact read back from
-its serving store; the registry compares its canonical artifact hash with the
-receipt decision (after-model for a commit, before-model for a rejection)
-before advancing the authenticated head. Catalog completeness, source
+opens the selected payload and replays the paired gate. In the reference
+implementation, `AuditRegistry` is also the authoritative serving store:
+`verify_and_append` compare-and-swaps the exact model bytes, model version,
+context head, receipt head, and receipt row in one SQLite transaction. A forced
+failure after the serving-row update rolls the entire transition back. An
+external serving system must implement the same linearizable transaction
+contract; an unauthenticated caller-supplied read-back is not accepted. Catalog completeness, source
 representativeness, authority validity, and authority/proposer
-non-collusion are deployment conditions. A handover is an immediate successor
+non-collusion are deployment conditions. Beacon validity additionally requires
+an unpredictable, unbiasable threshold source and a complete finality watcher;
+the ledger authenticates the monotonic parent chain and uniquely reserves each
+successor round for one fixation. A handover is an immediate successor
 of the live context: it preserves the twin identity, increments the state
 version by one, and may change domain, schema, authority, or evaluation policy
 while retaining the installed model version. The registry rejects rollback,

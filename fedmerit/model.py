@@ -632,7 +632,7 @@ class Candidate:
 
 @dataclass(frozen=True)
 class CommitProbe:
-    """Raw grouped probe opened by a 256-bit salt after beacon selection."""
+    """Raw grouped probe opened under the registered RO-hiding contract."""
 
     probe_id: str
     context_hash: str
@@ -673,7 +673,7 @@ class CommitProbe:
     def commitment(self) -> str:
         payload = canonical_bytes(
             {
-                "domain": "fedmerit-probe-payload-commitment-v3",
+                "domain": "fedmerit-probe-payload-commitment-v4-ro-ind",
                 "sealing_nonce": self.sealing_nonce,
                 "probe_id_hash": self.probe_id_hash,
                 "payload": {
@@ -693,7 +693,7 @@ class CommitProbe:
     def probe_id_hash(self) -> str:
         payload = canonical_bytes(
             {
-                "domain": "fedmerit-opaque-probe-id-v3",
+                "domain": "fedmerit-opaque-probe-id-v4-ro-ind",
                 "sealing_nonce": self.sealing_nonce,
                 "probe_id": self.probe_id,
             }

@@ -215,9 +215,12 @@ def validate_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
             "frame_authority_signature",
             "beacon_authentication",
             "beacon_head",
+            "beacon_randomness_contract",
             "watcher_completeness_required",
+            "exclusive_successor_reservation",
             "selection",
             "catalog_leaf",
+            "commitment_hiding_model",
             "catalog_root",
             "opening_nonce_bits",
             "catalog_signed_before_candidate_fixation",
@@ -232,11 +235,16 @@ def validate_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         or frame_policy.get("frame_authority_signature") != "Ed25519"
         or frame_policy.get("beacon_authentication") != "Ed25519"
         or frame_policy.get("beacon_head")
-        != "durable-signed-monotonic-immediate-parent-v1"
+        != "durable-signed-monotonic-immediate-parent-v2"
+        or frame_policy.get("beacon_randomness_contract")
+        != "external-threshold-unpredictable-unbiasable-v1"
         or frame_policy.get("watcher_completeness_required") is not True
+        or frame_policy.get("exclusive_successor_reservation") is not True
         or frame_policy.get("selection") != "beacon-sha256-rejection-sampling-v1"
         or frame_policy.get("catalog_leaf")
-        != "opaque-id-plus-nonce-hiding-payload-commitment"
+        != "opaque-id-plus-ro-hiding-payload-commitment-v1"
+        or frame_policy.get("commitment_hiding_model")
+        != "sha256-random-oracle-ind-hiding-v1"
         or frame_policy.get("catalog_root") != "sha256-merkle-v1"
         or frame_policy.get("opening_nonce_bits") != 256
         or frame_policy.get("catalog_signed_before_candidate_fixation") is not True
