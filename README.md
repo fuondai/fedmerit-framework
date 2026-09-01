@@ -37,6 +37,15 @@ python3 -m fedmerit.conformance
 The conformance command exits nonzero if any catalog, beacon, release, replay,
 handover, quorum, or receipt check fails.
 
+Run the deterministic regression suite from the repository root:
+
+```bash
+python3 -m pytest -q
+```
+
+The suite covers the wire encoder, replay rules, handover fencing, risk-budget
+spending, and the installed-artifact read-back boundary.
+
 ## Evidence producer
 
 ```bash
@@ -71,8 +80,12 @@ evidence directory; the implementation-level checks still run.
 
 Public receipt verification checks state, catalog, beacon, risk, and quorum
 bindings without revealing raw groups. Authorized verification additionally
-opens the selected payload and replays the paired gate. Catalog completeness,
-source representativeness, authority validity, and authority/proposer
+opens the selected payload and replays the paired gate. `verify_and_append`
+also requires the deployment adapter to pass the model artifact read back from
+its serving store; the registry compares its canonical artifact hash with the
+receipt decision (after-model for a commit, before-model for a rejection)
+before advancing the authenticated head. Catalog completeness, source
+representativeness, authority validity, and authority/proposer
 non-collusion are deployment conditions. A handover is an immediate successor
 of the live context: it preserves the twin identity, increments the state
 version by one, and may change domain, schema, authority, or evaluation policy

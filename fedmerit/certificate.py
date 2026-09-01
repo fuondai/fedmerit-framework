@@ -29,6 +29,7 @@ from .canonical import canonical_bytes
 from .model import (
     Candidate,
     EvaluationPolicy,
+    LinearModelArtifact,
     Receipt,
     ReceiptCore,
     RiskSchedule,
@@ -1624,7 +1625,26 @@ class AuditRegistry:
         frame_public_key: Ed25519PublicKey,
         schedule: RiskSchedule,
         risk_ledger: RiskLedger,
+        installed_model: LinearModelArtifact | None = None,
     ) -> bool:
+        """Verify a receipt and append it only after a model read-back check.
+
+        The deployment adapter supplies the artifact read back from its serving
+        store after staging the transition.  Comparing its canonical artifact
+        hash with the receipt's expected post-decision model prevents this
+        registry from recording a receipt for bytes that were never installed
+        (or for a different artifact with the same model version).
+        """
+        expected_model = (
+            candidate.after_model
+            if receipt.core.decision == "commit"
+            else candidate.before_model
+        )
+        if (
+            installed_model is None
+            or installed_model.artifact_hash != expected_model.artifact_hash
+        ):
+            return False
         if not verify_receipt(
             receipt,
             public_keys,

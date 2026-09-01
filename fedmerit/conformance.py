@@ -389,6 +389,11 @@ def run() -> dict[str, object]:
             frame_public_key=frame_private_key.public_key(),
             schedule=schedule,
             risk_ledger=ledger,
+            installed_model=(
+                candidate.after_model
+                if receipt.core.decision == "commit"
+                else candidate.before_model
+            ),
         )
         initial_head = registry.head
         initial_model = registry.installed_model_hash
@@ -413,6 +418,11 @@ def run() -> dict[str, object]:
             frame_public_key=frame_private_key.public_key(),
             schedule=schedule,
             risk_ledger=ledger,
+            installed_model=(
+                candidate.after_model
+                if receipt.core.decision == "commit"
+                else candidate.before_model
+            ),
         )
         historical_state_unchanged = (
             registry.head == initial_head
@@ -440,6 +450,11 @@ def run() -> dict[str, object]:
             frame_public_key=frame_private_key.public_key(),
             schedule=schedule,
             risk_ledger=ledger,
+            installed_model=(
+                candidate.after_model
+                if receipt.core.decision == "commit"
+                else candidate.before_model
+            ),
         )
         stale_state_unchanged = (
             stale.installed_model_hash == before.artifact_hash
@@ -520,6 +535,11 @@ def run() -> dict[str, object]:
             frame_public_key=frame_private_key.public_key(),
             schedule=schedule,
             risk_ledger=ledger,
+            installed_model=(
+                candidate.after_model
+                if issued_only_receipt.core.decision == "commit"
+                else candidate.before_model
+            ),
         )
 
         issuance_race = AuditRegistry(

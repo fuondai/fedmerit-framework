@@ -89,6 +89,49 @@ class SealedCatalogConformanceTests(unittest.TestCase):
     def test_cross_handover_risk_budget_is_registered(self) -> None:
         self.assertTrue(self.result["cross_handover_risk_budget_registered"])
 
+    def test_append_rejects_mismatched_installed_artifact(self) -> None:
+        with TemporaryDirectory(prefix="fedmerit-install-readback-") as directory:
+            case = _protocol_case(
+                Path(directory),
+                name="readback-mismatch",
+                after_bias=2.0,
+                epsilon=0.10,
+                gamma=0.05,
+                alpha=0.10,
+            )
+            release = case["store"].release(
+                case["candidate"],
+                signed_beacon_round=case["signed_beacon_round"],
+                beacon_public_key=case["beacon_private_key"].public_key(),
+                schedule=case["schedule"],
+                risk_ledger=case["ledger"],
+                audit_registry=case["registry"],
+            )
+            receipt = case["authority"].issue(
+                case["candidate"],
+                release,
+                store_public_key=case["store"].public_key,
+                frame_public_key=case["frame_private_key"].public_key(),
+                schedule=case["schedule"],
+                risk_ledger=case["ledger"],
+                audit_registry=case["registry"],
+            )
+            self.assertFalse(
+                case["registry"].verify_and_append(
+                    receipt,
+                    case["authority"].public_keys,
+                    f=1,
+                    release=release,
+                    candidate=case["candidate"],
+                    store_public_key=case["store"].public_key,
+                    frame_public_key=case["frame_private_key"].public_key(),
+                    schedule=case["schedule"],
+                    risk_ledger=case["ledger"],
+                    installed_model=LinearModelArtifact((0.0, 3.0)),
+                )
+            )
+            self.assertEqual(case["registry"].head, ZERO_HASH)
+
     def test_catalog_reassignment_is_rejected(self) -> None:
         self.assertTrue(self.result["catalog_reassignment_rejected"])
 
@@ -810,6 +853,7 @@ class ModelSuccessorTests(unittest.TestCase):
                     frame_public_key=case["frame_private_key"].public_key(),
                     schedule=case["schedule"],
                     risk_ledger=case["ledger"],
+                    installed_model=case["candidate"].after_model,
                 )
             )
             self.assertEqual(reopened.head, head_before_retry)
@@ -996,6 +1040,7 @@ class ModelSuccessorTests(unittest.TestCase):
                     frame_public_key=first["frame_private_key"].public_key(),
                     schedule=schedule,
                     risk_ledger=ledger,
+                    installed_model=candidate.after_model,
                 )
             )
             self.assertEqual(
