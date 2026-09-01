@@ -189,8 +189,8 @@ class LinearModelArtifact:
             _finite("model weight", value)
 
     @property
-    def artifact_hash(self) -> str:
-        return digest(
+    def artifact_bytes(self) -> bytes:
+        return canonical_bytes(
             {
                 "format": "fedmerit-linear-logit-v1",
                 "weights": self.weights,
@@ -198,6 +198,10 @@ class LinearModelArtifact:
                 "feature_scale": self.feature_scale,
             }
         )
+
+    @property
+    def artifact_hash(self) -> str:
+        return hashlib.sha256(self.artifact_bytes).hexdigest()
 
 
 @dataclass(frozen=True)

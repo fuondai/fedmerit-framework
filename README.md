@@ -54,7 +54,7 @@ spending, exclusive successor-round reservation, and crash-atomic installation.
 python3 scripts/produce_evidence.py --output output
 ```
 
-The producer writes 41 exact calculation and conformance records, aggregate
+The producer writes 44 exact calculation and conformance records, aggregate
 metrics, a known-answer receipt, and a SHA-256 manifest. It rejects a receipt
 that differs from `artifacts/reference_receipt.json`. Generated result
 directories are not part of the source distribution.
@@ -88,7 +88,13 @@ implementation, `AuditRegistry` is also the authoritative serving store:
 context head, receipt head, and receipt row in one SQLite transaction. A forced
 failure after the serving-row update rolls the entire transition back. An
 external serving system must implement the same linearizable transaction
-contract; an unauthenticated caller-supplied read-back is not accepted. Catalog completeness, source
+contract; an unauthenticated caller-supplied read-back is not accepted. The
+registry requires the complete genesis artifact, stores its canonical bytes at
+initialization, and applies the same exact-byte comparison to the first commit.
+`VerificationTrust.authority_certificate_hash` binds the roster epoch, fault
+threshold, witness keys, probe-store key, and frame-authority key to the live
+context; changing any field requires an explicitly certified successor context.
+Catalog completeness, source
 representativeness, authority validity, and authority/proposer
 non-collusion are deployment conditions. Beacon validity additionally requires
 an unpredictable, unbiasable threshold source and a complete finality watcher;

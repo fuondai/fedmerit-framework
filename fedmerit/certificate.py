@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import sqlite3
 from contextlib import closing
@@ -25,10 +26,11 @@ from .gate import (
     verify_public_release,
     verify_release,
 )
-from .canonical import canonical_bytes
+from .canonical import canonical_bytes, digest
 from .model import (
     Candidate,
     EvaluationPolicy,
+    LinearModelArtifact,
     Receipt,
     ReceiptCore,
     RiskSchedule,
@@ -55,6 +57,10 @@ def _require_digest(value: str, name: str) -> str:
     return value.lower()
 
 
+def _digest_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
 @dataclass(frozen=True)
 class VerificationTrust:
     """Context-scoped verifier keys and Byzantine threshold."""
@@ -63,6 +69,7 @@ class VerificationTrust:
     witness_public_keys: tuple[bytes, ...]
     store_public_key: bytes
     frame_public_key: bytes
+    roster_epoch: int = 0
 
     def __post_init__(self) -> None:
         if isinstance(self.f, bool) or not isinstance(self.f, int) or self.f < 0:
@@ -76,6 +83,17 @@ class VerificationTrust:
             raise ValueError("witness trust keys must be distinct Ed25519 public keys")
         if len(self.store_public_key) != 32 or len(self.frame_public_key) != 32:
             raise ValueError("store and frame trust roots must be Ed25519 public keys")
+        if (
+            isinstance(self.roster_epoch, bool)
+            or not isinstance(self.roster_epoch, int)
+            or not 0 <= self.roster_epoch < 1 << 32
+        ):
+            raise ValueError("roster_epoch must be an unsigned 32-bit integer")
+
+    @property
+    def authority_certificate_hash(self) -> str:
+        """Bind the roster epoch, threshold, and every verification key."""
+        return digest(self)
 
     @classmethod
     def from_keys(
@@ -85,12 +103,14 @@ class VerificationTrust:
         f: int,
         store_public_key: Ed25519PublicKey,
         frame_public_key: Ed25519PublicKey,
+        roster_epoch: int = 0,
     ) -> "VerificationTrust":
         return cls(
             f=f,
             witness_public_keys=tuple(_raw_public_key(key) for key in public_keys),
             store_public_key=_raw_public_key(store_public_key),
             frame_public_key=_raw_public_key(frame_public_key),
+            roster_epoch=roster_epoch,
         )
 
 
@@ -158,7 +178,13 @@ class Witness:
     state_path: str
 
     @classmethod
-    def open(cls, witness_index: int, state_path: str | Path) -> "Witness":
+    def open(
+        cls,
+        witness_index: int,
+        state_path: str | Path,
+        *,
+        private_key: Ed25519PrivateKey | None = None,
+    ) -> "Witness":
         path = Path(state_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with closing(sqlite3.connect(path, timeout=30, isolation_level=None)) as db:
@@ -178,7 +204,7 @@ class Witness:
                 "SELECT witness_index, private_key FROM witness_key WHERE id=1"
             ).fetchone()
             if row is None:
-                private_key = Ed25519PrivateKey.generate()
+                private_key = private_key or Ed25519PrivateKey.generate()
                 raw = private_key.private_bytes(
                     serialization.Encoding.Raw,
                     serialization.PrivateFormat.Raw,
@@ -192,7 +218,16 @@ class Witness:
                     raise ValueError(
                         "witness state belongs to a different witness index"
                     )
-                private_key = Ed25519PrivateKey.from_private_bytes(bytes(row[1]))
+                stored = bytes(row[1])
+                if private_key is not None:
+                    supplied = private_key.private_bytes(
+                        serialization.Encoding.Raw,
+                        serialization.PrivateFormat.Raw,
+                        serialization.NoEncryption(),
+                    )
+                    if supplied != stored:
+                        raise ValueError("witness state is bound to another private key")
+                private_key = Ed25519PrivateKey.from_private_bytes(stored)
         return cls(witness_index, private_key, str(path))
 
     def _connect(self) -> sqlite3.Connection:
@@ -251,7 +286,7 @@ class Witness:
 class CertificateAuthority:
     """Reference witness quorum; issuance derives all gate fields from fixation/release."""
 
-    def __init__(self, witnesses: list[Witness], f: int) -> None:
+    def __init__(self, witnesses: list[Witness], f: int, *, roster_epoch: int = 0) -> None:
         if isinstance(f, bool) or not isinstance(f, int) or f < 0:
             raise ValueError("f must be a non-negative integer")
         if len(witnesses) != 3 * f + 1:
@@ -264,16 +299,40 @@ class CertificateAuthority:
             raise ValueError("witness public keys must be distinct")
         self.witnesses = tuple(witnesses)
         self.f = f
+        if (
+            isinstance(roster_epoch, bool)
+            or not isinstance(roster_epoch, int)
+            or not 0 <= roster_epoch < 1 << 32
+        ):
+            raise ValueError("roster_epoch must be an unsigned 32-bit integer")
+        self.roster_epoch = roster_epoch
 
     @classmethod
-    def persistent(cls, directory: str | Path, f: int = 1) -> "CertificateAuthority":
+    def persistent(
+        cls,
+        directory: str | Path,
+        f: int = 1,
+        *,
+        private_keys: Sequence[Ed25519PrivateKey] | None = None,
+        roster_epoch: int = 0,
+    ) -> "CertificateAuthority":
         if isinstance(f, bool) or not isinstance(f, int) or f < 0:
             raise ValueError("f must be a non-negative integer")
         root = Path(directory)
         root.mkdir(parents=True, exist_ok=True)
+        if private_keys is not None and len(private_keys) != 3 * f + 1:
+            raise ValueError("private_keys must contain exactly 3f+1 keys")
         return cls(
-            [Witness.open(i, root / f"witness-{i}.sqlite3") for i in range(3 * f + 1)],
+            [
+                Witness.open(
+                    i,
+                    root / f"witness-{i}.sqlite3",
+                    private_key=None if private_keys is None else private_keys[i],
+                )
+                for i in range(3 * f + 1)
+            ],
             f,
+            roster_epoch=roster_epoch,
         )
 
     @property
@@ -297,8 +356,13 @@ class CertificateAuthority:
             f=self.f,
             store_public_key=store_public_key,
             frame_public_key=frame_public_key,
+            roster_epoch=self.roster_epoch,
         )
-        audit_registry.require_verification_trust(candidate.context_hash, trust)
+        audit_registry.require_verification_trust(
+            candidate.context_hash,
+            candidate.state_context.authority_certificate_hash,
+            trust,
+        )
         core: ReceiptCore | None = None
         signatures: list[WitnessSignature] = []
         for witness in self.witnesses[: 2 * self.f + 1]:
@@ -362,6 +426,7 @@ def _verify_public_receipt(
     schedule: RiskSchedule,
     risk_ledger: RiskLedger,
     audit_registry: "AuditRegistry",
+    roster_epoch: int = 0,
 ) -> bool:
     if f < 0 or len(public_keys) != 3 * f + 1:
         return False
@@ -370,8 +435,13 @@ def _verify_public_receipt(
         f=f,
         store_public_key=store_public_key,
         frame_public_key=frame_public_key,
+        roster_epoch=roster_epoch,
     )
-    audit_registry.require_verification_trust(candidate.context_hash, trust)
+    audit_registry.require_verification_trust(
+        candidate.context_hash,
+        candidate.state_context.authority_certificate_hash,
+        trust,
+    )
     encoded_public_keys = trust.witness_public_keys
     if len(set(encoded_public_keys)) != len(encoded_public_keys):
         return False
@@ -424,6 +494,7 @@ def verify_public_receipt(
     schedule: RiskSchedule,
     risk_ledger: RiskLedger,
     audit_registry: "AuditRegistry",
+    roster_epoch: int = 0,
 ) -> bool:
     """Verify public bindings and quorum without receiving the raw probe opening."""
     try:
@@ -438,6 +509,7 @@ def verify_public_receipt(
             schedule=schedule,
             risk_ledger=risk_ledger,
             audit_registry=audit_registry,
+            roster_epoch=roster_epoch,
         )
     except Exception:
         return False
@@ -455,6 +527,7 @@ def _verify_receipt(
     schedule: RiskSchedule,
     risk_ledger: RiskLedger,
     audit_registry: "AuditRegistry",
+    roster_epoch: int = 0,
 ) -> bool:
     if not _verify_public_receipt(
         receipt,
@@ -467,6 +540,7 @@ def _verify_receipt(
         schedule=schedule,
         risk_ledger=risk_ledger,
         audit_registry=audit_registry,
+        roster_epoch=roster_epoch,
     ):
         return False
     if not verify_release(release, candidate, store_public_key, frame_public_key):
@@ -488,6 +562,7 @@ def verify_receipt(
     schedule: RiskSchedule,
     risk_ledger: RiskLedger,
     audit_registry: "AuditRegistry",
+    roster_epoch: int = 0,
 ) -> bool:
     """Authorized raw-probe replay; return false for every malformed artifact."""
 
@@ -503,6 +578,7 @@ def verify_receipt(
             schedule=schedule,
             risk_ledger=risk_ledger,
             audit_registry=audit_registry,
+            roster_epoch=roster_epoch,
         )
     except Exception:
         return False
@@ -521,6 +597,7 @@ def verify_receipt_bytes(
     schedule: RiskSchedule,
     risk_ledger: RiskLedger,
     audit_registry: "AuditRegistry",
+    roster_epoch: int = 0,
 ) -> bool:
     try:
         receipt = Receipt.from_bytes(payload, witness_count=witness_count)
@@ -537,6 +614,7 @@ def verify_receipt_bytes(
         schedule=schedule,
         risk_ledger=risk_ledger,
         audit_registry=audit_registry,
+        roster_epoch=roster_epoch,
     )
 
 
@@ -547,14 +625,17 @@ class AuditRegistry:
         self,
         path: str | Path,
         *,
-        genesis_model_hash: str,
+        genesis_model: LinearModelArtifact,
         initial_context: StateContext,
         evaluation_policy: EvaluationPolicy,
         verification_trust: VerificationTrust | None = None,
     ) -> None:
         if str(path) == ":memory:":
             raise ValueError("audit registry must use durable storage")
-        genesis_model_hash = _require_digest(genesis_model_hash, "genesis_model_hash")
+        if not isinstance(genesis_model, LinearModelArtifact):
+            raise TypeError("genesis_model must be a LinearModelArtifact")
+        genesis_model_hash = genesis_model.artifact_hash
+        genesis_model_blob = genesis_model.artifact_bytes
         if initial_context.policy_hash != evaluation_policy.policy_hash:
             raise ValueError("initial context does not authorize the evaluation policy")
         self.path = str(path)
@@ -571,7 +652,7 @@ class AuditRegistry:
                     id INTEGER PRIMARY KEY CHECK(id=1),
                     model_hash TEXT NOT NULL,
                     model_version INTEGER NOT NULL,
-                    artifact_blob BLOB
+                    artifact_blob BLOB NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS context_head(
                     id INTEGER PRIMARY KEY CHECK(id=1),
@@ -694,19 +775,30 @@ class AuditRegistry:
                 "FROM audit_state WHERE id=1"
             ).fetchone()
             serving_model = db.execute(
-                "SELECT model_hash, model_version FROM serving_model WHERE id=1"
+                "SELECT model_hash, model_version, artifact_blob "
+                "FROM serving_model WHERE id=1"
             ).fetchone()
             expected_serving = (str(audit_model[0]), int(audit_model[1]))
             if serving_model is None:
+                if expected_serving[0] != genesis_model_hash:
+                    raise ValueError(
+                        "serving bytes are missing for a non-genesis installed model"
+                    )
                 db.execute(
                     "INSERT INTO serving_model "
-                    "(id, model_hash, model_version, artifact_blob) VALUES(1,?,?,NULL)",
-                    expected_serving,
+                    "(id, model_hash, model_version, artifact_blob) VALUES(1,?,?,?)",
+                    (*expected_serving, genesis_model_blob),
                 )
-            elif (str(serving_model[0]), int(serving_model[1])) != expected_serving:
-                raise ValueError(
-                    "serving model and authenticated audit state disagree"
-                )
+            else:
+                serving_blob = None if serving_model[2] is None else bytes(serving_model[2])
+                if (
+                    (str(serving_model[0]), int(serving_model[1])) != expected_serving
+                    or serving_blob is None
+                    or _digest_bytes(serving_blob) != str(serving_model[0])
+                ):
+                    raise ValueError(
+                        "serving model bytes and authenticated audit state disagree"
+                    )
             context_row = db.execute(
                 "SELECT context_hash, authority_certificate_hash, policy_hash, "
                 "twin_id, state_version, model_version FROM context_head WHERE id=1"
@@ -772,7 +864,10 @@ class AuditRegistry:
             )
             if verification_trust is not None:
                 self._provision_trust_locked(
-                    db, initial_context.context_hash, verification_trust
+                    db,
+                    initial_context.context_hash,
+                    initial_context.authority_certificate_hash,
+                    verification_trust,
                 )
 
     def _connect(self) -> sqlite3.Connection:
@@ -820,10 +915,18 @@ class AuditRegistry:
     def _provision_trust_locked(
         db: sqlite3.Connection,
         context_hash: str,
+        authority_certificate_hash: str,
         trust: VerificationTrust,
     ) -> None:
         if not isinstance(trust, VerificationTrust):
             raise TypeError("verification_trust must be a VerificationTrust")
+        expected_certificate = _require_digest(
+            authority_certificate_hash, "authority_certificate_hash"
+        )
+        if trust.authority_certificate_hash != expected_certificate:
+            raise ValueError(
+                "authority certificate does not bind the supplied verification roots"
+            )
         trust_blob = canonical_bytes(trust)
         existing = db.execute(
             "SELECT trust_blob FROM verification_trust WHERE context_hash=?",
@@ -851,17 +954,29 @@ class AuditRegistry:
                         "SELECT context_hash FROM context_head WHERE id=1"
                     ).fetchone()[0]
                 )
+            live = db.execute(
+                "SELECT context_hash, authority_certificate_hash "
+                "FROM context_head WHERE id=1"
+            ).fetchone()
+            if live is None or selected != str(live[0]):
+                db.rollback()
+                raise ValueError("verification roots may only provision the live context")
             if db.execute(
                 "SELECT 1 FROM registered_contexts WHERE context_hash=?", (selected,)
             ).fetchone() is None:
                 db.rollback()
                 raise ValueError("verification roots require a registered context")
-            self._provision_trust_locked(db, selected, trust)
+            self._provision_trust_locked(db, selected, str(live[1]), trust)
             db.commit()
 
     def require_verification_trust(
-        self, context_hash: str, trust: VerificationTrust
+        self,
+        context_hash: str,
+        authority_certificate_hash: str,
+        trust: VerificationTrust,
     ) -> None:
+        if trust.authority_certificate_hash != authority_certificate_hash:
+            raise ValueError("verification roots do not open the authority certificate")
         expected = canonical_bytes(trust)
         with closing(self._connect()) as db:
             row = db.execute(
@@ -1118,12 +1233,13 @@ class AuditRegistry:
         with closing(self._connect()) as db:
             db.execute("BEGIN IMMEDIATE")
             live = db.execute(
-                "SELECT context_hash, twin_id, state_version FROM context_head WHERE id=1"
+                "SELECT context_hash, authority_certificate_hash, twin_id, state_version "
+                "FROM context_head WHERE id=1"
             ).fetchone()
             if live is None:
                 db.rollback()
                 raise RuntimeError("context head is not initialized")
-            live_context_hash, live_twin, live_state_version = live
+            live_context_hash, live_authority, live_twin, live_state_version = live
             if state_context.twin_id != live_twin:
                 db.rollback()
                 raise ValueError("successor context must preserve the twin identity")
@@ -1171,6 +1287,11 @@ class AuditRegistry:
                     (live_context_hash,),
                 ).fetchone()
                 if inherited is not None:
+                    if _digest_bytes(bytes(inherited[0])) != state_context.authority_certificate_hash:
+                        db.rollback()
+                        raise ValueError(
+                            "successor authority certificate does not bind inherited roots"
+                        )
                     existing_trust = db.execute(
                         "SELECT trust_blob FROM verification_trust WHERE context_hash=?",
                         (state_context.context_hash,),
@@ -1188,7 +1309,10 @@ class AuditRegistry:
                     )
             else:
                 self._provision_trust_locked(
-                    db, state_context.context_hash, verification_trust
+                    db,
+                    state_context.context_hash,
+                    state_context.authority_certificate_hash,
+                    verification_trust,
                 )
             db.execute(
                 "UPDATE context_head SET context_hash=?, authority_certificate_hash=?, "
@@ -1317,6 +1441,11 @@ class AuditRegistry:
             candidate.risk_schedule_hash,
             candidate.risk_schedule_index,
         )
+        if (
+            verification_trust.authority_certificate_hash
+            != candidate.state_context.authority_certificate_hash
+        ):
+            raise ValueError("verification roots do not open the authority certificate")
         with closing(self._connect()) as db:
             db.execute("BEGIN IMMEDIATE")
             self._require_risk_schedule_locked(db, schedule)
@@ -1547,12 +1676,13 @@ class AuditRegistry:
                 "SELECT model_hash, model_version, artifact_blob "
                 "FROM serving_model WHERE id=1"
             ).fetchone()
-            before_blob = canonical_bytes(candidate.before_model)
+            before_blob = candidate.before_model.artifact_bytes
             if (
                 serving is None
                 or str(serving[0]) != installed
                 or int(serving[1]) != int(installed_version)
-                or (serving[2] is not None and bytes(serving[2]) != before_blob)
+                or serving[2] is None
+                or bytes(serving[2]) != before_blob
             ):
                 db.rollback()
                 raise ValueError(
@@ -1573,6 +1703,14 @@ class AuditRegistry:
                     db.rollback()
                     raise ValueError(
                         "committed model successor requires inherited verification roots"
+                    )
+                if (
+                    _digest_bytes(bytes(inherited_trust[0]))
+                    != candidate.state_context.authority_certificate_hash
+                ):
+                    db.rollback()
+                    raise ValueError(
+                        "live authority certificate does not bind inherited roots"
                     )
                 successor_blob = canonical_bytes(successor_context)
                 registered_successor = db.execute(
@@ -1630,7 +1768,7 @@ class AuditRegistry:
                 1 if core.decision == "commit" else 0
             )
             serving_blob_next = (
-                canonical_bytes(candidate.after_model)
+                candidate.after_model.artifact_bytes
                 if core.decision == "commit"
                 else before_blob
             )
@@ -1695,6 +1833,7 @@ class AuditRegistry:
         frame_public_key: Ed25519PublicKey,
         schedule: RiskSchedule,
         risk_ledger: RiskLedger,
+        roster_epoch: int = 0,
     ) -> bool:
         """Verify, install, and append at one SQLite linearization point.
 
@@ -1715,6 +1854,7 @@ class AuditRegistry:
             schedule=schedule,
             risk_ledger=risk_ledger,
             audit_registry=self,
+            roster_epoch=roster_epoch,
         ):
             return False
         try:

@@ -54,6 +54,29 @@ def run() -> dict[str, object]:
     with TemporaryDirectory(prefix="fedmerit-conformance-") as directory:
         root = Path(directory)
         policy = EvaluationPolicy("brier-decimal80-v1")
+        before = LinearModelArtifact((0.0, 0.0))
+        after = LinearModelArtifact((0.0, 1.0))
+        frame_private_key = Ed25519PrivateKey.from_private_bytes(
+            hashlib.sha256(b"conformance-frame-authority").digest()
+        )
+        store_private_key = Ed25519PrivateKey.from_private_bytes(
+            hashlib.sha256(b"conformance-probe-store").digest()
+        )
+        witness_private_keys = tuple(
+            Ed25519PrivateKey.from_private_bytes(
+                hashlib.sha256(f"conformance-witness-{index}".encode()).digest()
+            )
+            for index in range(4)
+        )
+        authority = CertificateAuthority.persistent(
+            root / "witnesses", f=1, private_keys=witness_private_keys
+        )
+        trust = VerificationTrust.from_keys(
+            authority.public_keys,
+            f=1,
+            store_public_key=store_private_key.public_key(),
+            frame_public_key=frame_private_key.public_key(),
+        )
         context = StateContext(
             "twin-0",
             "domain-0",
@@ -61,10 +84,8 @@ def run() -> dict[str, object]:
             _digest("schema-0"),
             policy.policy_hash,
             0,
-            _digest("authority-0"),
+            trust.authority_certificate_hash,
         )
-        before = LinearModelArtifact((0.0, 0.0))
-        after = LinearModelArtifact((0.0, 1.0))
         probes = tuple(
             CommitProbe(
                 f"probe-{index}",
@@ -103,9 +124,6 @@ def run() -> dict[str, object]:
             ),
             "reference-beacon",
             hashlib.sha256(beacon_public_key_bytes).hexdigest(),
-        )
-        frame_private_key = Ed25519PrivateKey.from_private_bytes(
-            hashlib.sha256(b"conformance-frame-authority").digest()
         )
         signed_frame = sign_sampling_frame(frame, frame_private_key)
         contributor_root = _digest("contributors-0")
@@ -154,9 +172,10 @@ def run() -> dict[str, object]:
         )
         registry = AuditRegistry(
             root / "audit.sqlite3",
-            genesis_model_hash=before.artifact_hash,
+            genesis_model=before,
             initial_context=context,
             evaluation_policy=policy,
+            verification_trust=trust,
         )
         registry.provision_lineage_risk_budget(0.9999)
         ledger = RiskLedger(root / "risk.sqlite3")
@@ -209,6 +228,7 @@ def run() -> dict[str, object]:
             signed_frame,
             frame_private_key.public_key(),
             root / "probe.sqlite3",
+            store_private_key=store_private_key,
         )
         reassigned = (
             replace(probes[0], groups=probes[1].groups),
@@ -284,14 +304,6 @@ def run() -> dict[str, object]:
             )
         except ValueError:
             concurrent_retirement_rejected = True
-        authority = CertificateAuthority.persistent(root / "witnesses", f=1)
-        trust = VerificationTrust.from_keys(
-            authority.public_keys,
-            f=1,
-            store_public_key=store.public_key,
-            frame_public_key=frame_private_key.public_key(),
-        )
-        registry.provision_verification_trust(trust)
         release = store.release(
             candidate,
             signed_beacon_round=signed_beacon_round,
@@ -400,7 +412,7 @@ def run() -> dict[str, object]:
             _digest("schema-1"),
             policy.policy_hash,
             0,
-            _digest("authority-1"),
+            trust.authority_certificate_hash,
         )
         registry.handover(state_context=successor, evaluation_policy=policy)
         historical_replay = registry.verify_and_append(
@@ -423,7 +435,7 @@ def run() -> dict[str, object]:
 
         stale = AuditRegistry(
             root / "stale.sqlite3",
-            genesis_model_hash=before.artifact_hash,
+            genesis_model=before,
             initial_context=context,
             evaluation_policy=policy,
             verification_trust=trust,
@@ -465,7 +477,7 @@ def run() -> dict[str, object]:
 
         issued_only = AuditRegistry(
             root / "issued-only.sqlite3",
-            genesis_model_hash=before.artifact_hash,
+            genesis_model=before,
             initial_context=context,
             evaluation_policy=policy,
             verification_trust=trust,
@@ -492,7 +504,7 @@ def run() -> dict[str, object]:
             _digest("schema-issued-only"),
             policy.policy_hash,
             0,
-            _digest("authority-issued-only"),
+            trust.authority_certificate_hash,
         )
         issued_only.handover(
             state_context=issued_only_successor,
@@ -524,7 +536,7 @@ def run() -> dict[str, object]:
 
         issuance_race = AuditRegistry(
             root / "issuance-race.sqlite3",
-            genesis_model_hash=before.artifact_hash,
+            genesis_model=before,
             initial_context=context,
             evaluation_policy=policy,
             verification_trust=trust,
@@ -564,7 +576,7 @@ def run() -> dict[str, object]:
                 _digest("schema-issuance-race"),
                 policy.policy_hash,
                 0,
-                _digest("authority-issuance-race"),
+                trust.authority_certificate_hash,
             ),
             evaluation_policy=policy,
         )

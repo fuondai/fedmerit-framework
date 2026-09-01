@@ -184,6 +184,27 @@ def _protocol_case(
 ) -> dict[str, Any]:
     group_count = group_count or required_groups(alpha, epsilon, gamma)
     policy = EVALUATION_POLICY
+    frame_private_key = Ed25519PrivateKey.from_private_bytes(
+        hashlib.sha256(f"{name}:frame-authority-key".encode()).digest()
+    )
+    store_private_key = Ed25519PrivateKey.from_private_bytes(
+        hashlib.sha256(f"{name}:probe-store-key".encode()).digest()
+    )
+    witness_private_keys = tuple(
+        Ed25519PrivateKey.from_private_bytes(
+            hashlib.sha256(f"{name}:witness-key:{index}".encode()).digest()
+        )
+        for index in range(4)
+    )
+    authority = CertificateAuthority.persistent(
+        root / "witnesses", f=1, private_keys=witness_private_keys
+    )
+    trust = VerificationTrust.from_keys(
+        authority.public_keys,
+        f=1,
+        store_public_key=store_private_key.public_key(),
+        frame_public_key=frame_private_key.public_key(),
+    )
     context = StateContext(
         f"twin-{name}",
         "domain-0",
@@ -191,7 +212,7 @@ def _protocol_case(
         hashlib.sha256(f"{name}:schema".encode()).hexdigest(),
         policy.policy_hash,
         11,
-        hashlib.sha256(f"{name}:authority".encode()).hexdigest(),
+        trust.authority_certificate_hash,
     )
     before = LinearModelArtifact((0.0, 0.0))
     after = LinearModelArtifact((0.0, after_bias))
@@ -246,9 +267,6 @@ def _protocol_case(
         beacon_id,
         hashlib.sha256(beacon_public_key_bytes).hexdigest(),
     )
-    frame_private_key = Ed25519PrivateKey.from_private_bytes(
-        hashlib.sha256(f"{name}:frame-authority-key".encode()).digest()
-    )
     signed_frame = sign_sampling_frame(frame, frame_private_key)
     contributor_root = hashlib.sha256(f"{name}:contributors".encode()).hexdigest()
     score_commitment = hashlib.sha256(f"{name}:score".encode()).hexdigest()
@@ -292,9 +310,10 @@ def _protocol_case(
     )
     registry = AuditRegistry(
         root / "audit.sqlite3",
-        genesis_model_hash=before.artifact_hash,
+        genesis_model=before,
         initial_context=context,
         evaluation_policy=policy,
+        verification_trust=trust,
     )
     ledger = RiskLedger(root / "risk.sqlite3")
     ledger.register(schedule, audit_registry=registry)
@@ -326,15 +345,7 @@ def _protocol_case(
         signed_frame,
         frame_private_key.public_key(),
         root / "probe.sqlite3",
-    )
-    authority = CertificateAuthority.persistent(root / "witnesses", f=1)
-    registry.provision_verification_trust(
-        VerificationTrust.from_keys(
-            authority.public_keys,
-            f=1,
-            store_public_key=store.public_key,
-            frame_public_key=frame_private_key.public_key(),
-        )
+        store_private_key=store_private_key,
     )
     return {
         "context": context,
@@ -356,6 +367,7 @@ def _protocol_case(
         "ledger": ledger,
         "store": store,
         "authority": authority,
+        "trust": trust,
     }
 
 
@@ -504,9 +516,7 @@ def _handover_rows() -> list[dict[str, Any]]:
                     ).hexdigest(),
                     case["policy"].policy_hash,
                     registry.installed_model_version,
-                    hashlib.sha256(
-                        f"successor-authority:{position}".encode()
-                    ).hexdigest(),
+                    case["trust"].authority_certificate_hash,
                 )
                 registry.handover(
                     state_context=successor,
@@ -871,7 +881,7 @@ def _integrity_rows() -> list[dict[str, Any]]:
         try:
             AuditRegistry(
                 Path(directory) / "audit.sqlite3",
-                genesis_model_hash=case["before"].artifact_hash,
+                genesis_model=case["before"],
                 initial_context=wrong_context,
                 evaluation_policy=case["policy"],
             )
@@ -1000,7 +1010,7 @@ def _integrity_rows() -> list[dict[str, Any]]:
             hashlib.sha256(b"successor-integrity-schema").hexdigest(),
             case["policy"].policy_hash,
             case["context"].model_version + 1,
-            hashlib.sha256(b"successor-integrity-authority").hexdigest(),
+            case["trust"].authority_certificate_hash,
         )
         case["registry"].handover(
             state_context=successor,
@@ -1029,6 +1039,121 @@ def _integrity_rows() -> list[dict[str, Any]]:
                     and case["registry"].context_head
                     == (successor.context_hash, successor.authority_certificate_hash)
                 ),
+            }
+        )
+
+        genesis_case = _protocol_case(
+            Path(directory) / "genesis-byte-binding",
+            name="genesis-byte-binding",
+            after_bias=2.0,
+            epsilon=0.10,
+            gamma=0.05,
+            alpha=0.10,
+        )
+        genesis_exact = genesis_case["registry"].serving_model_snapshot == (
+            genesis_case["before"].artifact_hash,
+            genesis_case["context"].model_version,
+            genesis_case["before"].artifact_bytes,
+        )
+        with sqlite3.connect(genesis_case["registry"].path) as db:
+            db.execute(
+                "UPDATE serving_model SET artifact_blob=? WHERE id=1",
+                (b"tampered-genesis",),
+            )
+        tampered_genesis_rejected = False
+        try:
+            AuditRegistry(
+                genesis_case["registry"].path,
+                genesis_model=genesis_case["before"],
+                initial_context=genesis_case["context"],
+                evaluation_policy=genesis_case["policy"],
+                verification_trust=genesis_case["trust"],
+            )
+        except ValueError:
+            tampered_genesis_rejected = True
+        rows.append(
+            {
+                "kind": "integrity_check",
+                "check": "exact_genesis_artifact_bound",
+                "passed": genesis_exact and tampered_genesis_rejected,
+            }
+        )
+
+        rotated_epoch = replace(case["trust"], roster_epoch=1)
+        altered_authority_rejected = False
+        try:
+            case["registry"].provision_verification_trust(rotated_epoch)
+        except ValueError:
+            altered_authority_rejected = True
+        rows.append(
+            {
+                "kind": "integrity_check",
+                "check": "authority_roster_epoch_bound",
+                "passed": (
+                    case["context"].authority_certificate_hash
+                    == case["trust"].authority_certificate_hash
+                    and altered_authority_rejected
+                ),
+            }
+        )
+
+        lineage_model = LinearModelArtifact((0.0, 0.0))
+        lineage_context = StateContext(
+            "trace-lineage",
+            "domain-0",
+            0,
+            hashlib.sha256(b"trace-lineage-schema-0").hexdigest(),
+            EVALUATION_POLICY.policy_hash,
+            0,
+            hashlib.sha256(b"trace-lineage-authority-0").hexdigest(),
+        )
+        lineage_registry = AuditRegistry(
+            Path(directory) / "lineage-budget.sqlite3",
+            genesis_model=lineage_model,
+            initial_context=lineage_context,
+            evaluation_policy=EVALUATION_POLICY,
+        )
+        lineage_registry.provision_lineage_risk_budget(0.15)
+        lineage_registry.register_risk_schedule(
+            RiskSchedule(
+                "trace-lineage-schedule-0",
+                lineage_context.context_hash,
+                ZERO_HASH,
+                0.10,
+                (RiskAllocation(0.25, 0.05, 0.10, 1),),
+            )
+        )
+        lineage_successor = StateContext(
+            lineage_context.twin_id,
+            "domain-1",
+            1,
+            hashlib.sha256(b"trace-lineage-schema-1").hexdigest(),
+            EVALUATION_POLICY.policy_hash,
+            0,
+            hashlib.sha256(b"trace-lineage-authority-1").hexdigest(),
+        )
+        lineage_registry.handover(
+            state_context=lineage_successor,
+            evaluation_policy=EVALUATION_POLICY,
+        )
+        cross_handover_budget_rejected = False
+        try:
+            lineage_registry.register_risk_schedule(
+                RiskSchedule(
+                    "trace-lineage-schedule-1",
+                    lineage_successor.context_hash,
+                    ZERO_HASH,
+                    0.10,
+                    (RiskAllocation(0.25, 0.05, 0.10, 1),),
+                )
+            )
+        except ValueError:
+            cross_handover_budget_rejected = True
+        rows.append(
+            {
+                "kind": "integrity_check",
+                "check": "cross_handover_budget_rejected",
+                "passed": cross_handover_budget_rejected,
             }
         )
     return rows

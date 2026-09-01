@@ -162,7 +162,80 @@ class SealedCatalogConformanceTests(unittest.TestCase):
             self.assertEqual(
                 installed_version, case["candidate"].state_context.model_version + 1
             )
-            self.assertEqual(installed_blob, canonical_bytes(case["candidate"].after_model))
+            self.assertEqual(installed_blob, case["candidate"].after_model.artifact_bytes)
+
+    def test_first_append_requires_exact_genesis_artifact_bytes(self) -> None:
+        with TemporaryDirectory(prefix="fedmerit-genesis-bytes-") as directory:
+            case = _protocol_case(
+                Path(directory),
+                name="genesis-bytes",
+                after_bias=2.0,
+                epsilon=0.10,
+                gamma=0.05,
+                alpha=0.10,
+            )
+            self.assertEqual(
+                case["registry"].serving_model_snapshot,
+                (
+                    case["before"].artifact_hash,
+                    case["context"].model_version,
+                    case["before"].artifact_bytes,
+                ),
+            )
+            release = case["store"].release(
+                case["candidate"],
+                signed_beacon_round=case["signed_beacon_round"],
+                beacon_public_key=case["beacon_private_key"].public_key(),
+                schedule=case["schedule"],
+                risk_ledger=case["ledger"],
+                audit_registry=case["registry"],
+            )
+            receipt = case["authority"].issue(
+                case["candidate"],
+                release,
+                store_public_key=case["store"].public_key,
+                frame_public_key=case["frame_private_key"].public_key(),
+                schedule=case["schedule"],
+                risk_ledger=case["ledger"],
+                audit_registry=case["registry"],
+            )
+            with sqlite3.connect(case["registry"].path) as db:
+                db.execute(
+                    "UPDATE serving_model SET artifact_blob=? WHERE id=1",
+                    (b"tampered-genesis",),
+                )
+            self.assertFalse(
+                case["registry"].verify_and_append(
+                    receipt,
+                    case["authority"].public_keys,
+                    f=1,
+                    release=release,
+                    candidate=case["candidate"],
+                    store_public_key=case["store"].public_key,
+                    frame_public_key=case["frame_private_key"].public_key(),
+                    schedule=case["schedule"],
+                    risk_ledger=case["ledger"],
+                )
+            )
+            self.assertEqual(case["registry"].head, ZERO_HASH)
+
+    def test_authority_certificate_opens_to_exact_roster_and_epoch(self) -> None:
+        with TemporaryDirectory(prefix="fedmerit-authority-binding-") as directory:
+            case = _protocol_case(
+                Path(directory),
+                name="authority-binding",
+                after_bias=2.0,
+                epsilon=0.10,
+                gamma=0.05,
+                alpha=0.10,
+            )
+            self.assertEqual(
+                case["context"].authority_certificate_hash,
+                case["trust"].authority_certificate_hash,
+            )
+            rotated_epoch = replace(case["trust"], roster_epoch=1)
+            with self.assertRaisesRegex(ValueError, "authority certificate"):
+                case["registry"].provision_verification_trust(rotated_epoch)
 
     def test_catalog_reassignment_is_rejected(self) -> None:
         self.assertTrue(self.result["catalog_reassignment_rejected"])
@@ -392,7 +465,7 @@ class LineageRiskBudgetTests(unittest.TestCase):
             )
             registry = AuditRegistry(
                 path,
-                genesis_model_hash=model.artifact_hash,
+                genesis_model=model,
                 initial_context=context,
                 evaluation_policy=policy,
             )
@@ -431,7 +504,7 @@ class LineageRiskBudgetTests(unittest.TestCase):
 
             reopened = AuditRegistry(
                 path,
-                genesis_model_hash=model.artifact_hash,
+                genesis_model=model,
                 initial_context=successor,
                 evaluation_policy=policy,
             )
@@ -747,10 +820,11 @@ class ContextHandoverTests(unittest.TestCase):
             7,
             _digest("authority-a"),
         )
+        self.genesis_model = LinearModelArtifact((0.0, 0.0))
         self.path = Path(self.directory.name) / "audit.sqlite3"
         self.registry = AuditRegistry(
             self.path,
-            genesis_model_hash=_digest("genesis-model"),
+            genesis_model=self.genesis_model,
             initial_context=self.initial,
             evaluation_policy=self.policy,
         )
@@ -784,7 +858,7 @@ class ContextHandoverTests(unittest.TestCase):
         )
         reopened = AuditRegistry(
             self.path,
-            genesis_model_hash=_digest("genesis-model"),
+            genesis_model=self.genesis_model,
             initial_context=successor,
             evaluation_policy=self.policy,
         )
@@ -886,7 +960,7 @@ class ModelSuccessorTests(unittest.TestCase):
 
             reopened = AuditRegistry(
                 root / "audit.sqlite3",
-                genesis_model_hash=case["before"].artifact_hash,
+                genesis_model=case["before"],
                 initial_context=successor,
                 evaluation_policy=case["policy"],
             )
@@ -940,7 +1014,7 @@ class ModelSuccessorTests(unittest.TestCase):
                 _digest("schema-b"),
                 successor.policy_hash,
                 successor.model_version,
-                _digest("authority-b"),
+                case["trust"].authority_certificate_hash,
             )
             reopened.handover(
                 state_context=handover,
@@ -1295,7 +1369,7 @@ class ModelSuccessorTests(unittest.TestCase):
                 _digest("release-handover-schema"),
                 first["policy"].policy_hash,
                 first["context"].model_version,
-                _digest("release-handover-authority"),
+                first["trust"].authority_certificate_hash,
             )
             first["registry"].handover(
                 state_context=successor,
