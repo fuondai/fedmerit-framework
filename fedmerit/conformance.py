@@ -20,6 +20,7 @@ from .certificate import (
     verify_receipt,
 )
 from .gate import (
+    BeaconService,
     CommitProbeStore,
     RiskLedger,
     sign_beacon_round,
@@ -227,14 +228,19 @@ def run() -> dict[str, object]:
             signed_frame=signed_frame,
             frame_public_key=frame_private_key.public_key(),
         )
-        signed_beacon_round = sign_beacon_round(
-            BeaconRound(
-                "reference-beacon",
-                41,
-                signed_beacon_head.round.round_hash,
-                hashlib.sha256(b"registered-conformance-beacon-round-41").digest(),
-            ),
-            beacon_private_key,
+        beacon_service = BeaconService(
+            root / "beacon.sqlite3",
+            beacon_id="reference-beacon",
+            checkpoint=signed_beacon_head,
+            private_key=beacon_private_key,
+            entropy_seed=hashlib.sha256(b"conformance-beacon-entropy").digest(),
+        )
+        fixation_reservation = beacon_service.reserve_fixation(
+            candidate,
+            risk_ledger=ledger,
+        )
+        signed_beacon_round = beacon_service.finalize_successor(
+            fixation_reservation
         )
         store = CommitProbeStore(
             list(probes),
@@ -431,7 +437,11 @@ def run() -> dict[str, object]:
             0,
             trust.authority_certificate_hash,
         )
-        registry.handover(state_context=successor, evaluation_policy=policy)
+        registry.handover(
+            state_context=successor,
+            evaluation_policy=policy,
+            authorizer=authority,
+        )
         historical_replay = registry.verify_and_append(
             receipt,
             authority.public_keys,
@@ -459,7 +469,15 @@ def run() -> dict[str, object]:
         )
         stale.provision_lineage_risk_budget(0.9999)
         stale.register_risk_schedule(schedule)
-        stale.handover(state_context=successor, evaluation_policy=policy)
+        stale.handover(
+            state_context=successor,
+            evaluation_policy=policy,
+            authorizer=CertificateAuthority.persistent(
+                root / "stale-handover-witnesses",
+                f=1,
+                private_keys=witness_private_keys,
+            ),
+        )
         stale_append = stale.verify_and_append(
             receipt,
             authority.public_keys,
@@ -528,6 +546,11 @@ def run() -> dict[str, object]:
         issued_only.handover(
             state_context=issued_only_successor,
             evaluation_policy=policy,
+            authorizer=CertificateAuthority.persistent(
+                root / "issued-only-handover-witnesses",
+                f=1,
+                private_keys=witness_private_keys,
+            ),
         )
         issued_receipt_verifiable_after_handover = verify_receipt(
             issued_only_receipt,
@@ -599,6 +622,11 @@ def run() -> dict[str, object]:
                 trust.authority_certificate_hash,
             ),
             evaluation_policy=policy,
+            authorizer=CertificateAuthority.persistent(
+                root / "issuance-race-handover-witnesses",
+                f=1,
+                private_keys=witness_private_keys,
+            ),
         )
         final_issuance_fence_rejected = False
         try:

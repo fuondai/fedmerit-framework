@@ -212,6 +212,15 @@ class LinearModelArtifact:
             raise ValueError(
                 "feature_mean and feature_scale must both be present or both absent"
             )
+        if not feature_mean:
+            # The evaluator has only one representation for identity
+            # preprocessing.  Normalizing here prevents an omitted affine
+            # transform and explicit zero/one vectors from producing distinct
+            # artifact commitments for the same executable model.
+            feature_mean = (0.0,) * width
+            feature_scale = (1.0,) * width
+            object.__setattr__(self, "feature_mean", feature_mean)
+            object.__setattr__(self, "feature_scale", feature_scale)
         if feature_mean and (
             len(feature_mean) != width or len(feature_scale) != width
         ):
@@ -651,6 +660,8 @@ class BeaconRound:
     round_number: int
     previous_round_hash: str
     randomness: bytes
+    fixation_hash: str = ZERO_HASH
+    reservation_hash: str = ZERO_HASH
 
     def __post_init__(self) -> None:
         _required("beacon_id", self.beacon_id)
@@ -658,6 +669,12 @@ class BeaconRound:
         if self.round_number == 0:
             raise ValueError("beacon round must be positive")
         _sha256("previous_round_hash", self.previous_round_hash)
+        _sha256("fixation_hash", self.fixation_hash)
+        _sha256("reservation_hash", self.reservation_hash)
+        if (self.fixation_hash == ZERO_HASH) != (self.reservation_hash == ZERO_HASH):
+            raise ValueError(
+                "beacon fixation and reservation commitments must both be present"
+            )
         if not isinstance(self.randomness, (bytes, bytearray)):
             raise TypeError("beacon randomness must be bytes")
         randomness = bytes(self.randomness)
@@ -667,13 +684,57 @@ class BeaconRound:
 
     @property
     def round_hash(self) -> str:
-        return digest({"domain": "fedmerit-beacon-round-v1", "round": self})
+        return digest({"domain": "fedmerit-beacon-round-v2", "round": self})
+
+
+@dataclass(frozen=True)
+class BeaconFixationReservation:
+    """Pre-randomness commitment accepted by the durable beacon service."""
+
+    beacon_id: str
+    round_number: int
+    parent_round_hash: str
+    fixation_hash: str
+
+    def __post_init__(self) -> None:
+        _required("beacon_id", self.beacon_id)
+        _uint32("round_number", self.round_number)
+        if self.round_number == 0:
+            raise ValueError("beacon reservation round must be positive")
+        _sha256("parent_round_hash", self.parent_round_hash)
+        _sha256("fixation_hash", self.fixation_hash)
+        if self.fixation_hash == ZERO_HASH:
+            raise ValueError("beacon reservation needs a nonzero fixation hash")
+
+    @property
+    def reservation_hash(self) -> str:
+        return digest(
+            {
+                "domain": "fedmerit-beacon-fixation-reservation-v1",
+                "reservation": self,
+            }
+        )
+
+
+@dataclass(frozen=True)
+class SignedBeaconFixationReservation:
+    reservation: BeaconFixationReservation
+    signature: bytes
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.signature, (bytes, bytearray)):
+            raise TypeError("beacon reservation signature must be bytes")
+        signature = bytes(self.signature)
+        object.__setattr__(self, "signature", signature)
+        if len(signature) != 64:
+            raise ValueError("beacon reservation Ed25519 signature must be 64 bytes")
 
 
 @dataclass(frozen=True)
 class SignedBeaconRound:
     round: BeaconRound
     signature: bytes
+    fixation_reservation: SignedBeaconFixationReservation | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.signature, (bytes, bytearray)):
@@ -682,6 +743,22 @@ class SignedBeaconRound:
         object.__setattr__(self, "signature", signature)
         if len(signature) != 64:
             raise ValueError("beacon transcript signature must be 64 bytes")
+        reservation = self.fixation_reservation
+        if self.round.fixation_hash == ZERO_HASH:
+            if reservation is not None:
+                raise ValueError("checkpoint beacon rounds cannot carry a reservation")
+            return
+        if reservation is None:
+            raise ValueError("post-fixation beacon rounds need a signed reservation")
+        reserved = reservation.reservation
+        if (
+            reserved.beacon_id != self.round.beacon_id
+            or reserved.round_number != self.round.round_number
+            or reserved.parent_round_hash != self.round.previous_round_hash
+            or reserved.fixation_hash != self.round.fixation_hash
+            or reserved.reservation_hash != self.round.reservation_hash
+        ):
+            raise ValueError("beacon round does not match its fixation reservation")
 
 
 @dataclass(frozen=True)

@@ -2,13 +2,16 @@
 
 from .certificate import (
     AuditRegistry,
+    HandoverAuthorization,
     CertificateAuthority,
     VerificationTrust,
+    verify_handover_authorization,
     verify_public_receipt,
     verify_receipt,
     verify_receipt_bytes,
 )
 from .gate import (
+    BeaconService,
     CommitProbeStore,
     PublicProbeRelease,
     RiskLedger,
@@ -23,9 +26,11 @@ from .gate import (
     sign_sampling_frame,
     verify_sampling_frame,
     verify_sampling_frame_commitment,
+    verify_beacon_fixation_reservation,
     verify_public_release,
 )
 from .model import (
+    BeaconFixationReservation,
     BeaconRound,
     Candidate,
     CommitProbe,
@@ -42,6 +47,7 @@ from .model import (
     SecurityProfile,
     SignedSamplingFrame,
     SignedSamplingFrameCommitment,
+    SignedBeaconFixationReservation,
     SignedBeaconRound,
     SourcePartition,
     StateContext,
@@ -50,9 +56,12 @@ from .model import (
 
 __all__ = [
     "AuditRegistry",
+    "BeaconService",
+    "BeaconFixationReservation",
     "BeaconRound",
     "Candidate",
     "CertificateAuthority",
+    "HandoverAuthorization",
     "VerificationTrust",
     "CommitProbe",
     "ContributorLeaf",
@@ -70,6 +79,7 @@ __all__ = [
     "SecurityProfile",
     "SignedSamplingFrame",
     "SignedSamplingFrameCommitment",
+    "SignedBeaconFixationReservation",
     "SignedBeaconRound",
     "Receipt",
     "SourcePartition",
@@ -86,7 +96,9 @@ __all__ = [
     "sign_sampling_frame",
     "verify_sampling_frame",
     "verify_sampling_frame_commitment",
+    "verify_beacon_fixation_reservation",
     "verify_public_release",
+    "verify_handover_authorization",
     "verify_public_receipt",
     "verify_receipt",
     "verify_receipt_bytes",

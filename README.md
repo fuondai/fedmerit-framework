@@ -122,15 +122,28 @@ UR3 CobotOps workbook (DOI `10.24432/C5J891`). It treats operation cycles as
 non-IID groups and keeps proposal, score, commit, and audit groups disjoint.
 The driver compares FedAvg, coordinate median, Krum, FLTrust, FedVal, and the
 cluster-representative FLShield path under sign-flip and model-replacement
-attacks. Every proposal is evaluated twice: once as an unguarded installation
-and once through the exact Decimal80 FedMERIT paired replay. It writes raw
-per-seed records, 95% confidence intervals, and split metadata; it does not
-replace the cryptographic conformance suite.
+attacks. Each candidate first receives its unguarded audit score and then runs
+through an isolated end-to-end FedMERIT instance: signed frame, finite risk
+schedule, durable beacon fixation and successor, one-use probe release, exact
+Decimal80 replay by a 2f+1 quorum, and atomic `verify_and_append`. One of four
+witnesses is deliberately unavailable in every trial. The driver reads the
+decision and paired statistic from the issued receipt, then verifies the
+installed model hash, version, and bytes from the authoritative serving store.
+One trial per seed also races two idempotent append retries. Raw records include
+these protocol checks and timings; `metadata.json` aggregates their pass counts.
+
+Run the retained protocol with:
+
+```bash
+python3 -m scripts.run_ur3_benchmark \
+  --dataset /path/to/UR3_CobotOps.xlsx \
+  --output results/ur3
+```
 
 The workload requires the optional dependencies in
-`requirements-experiments.txt` and should be run on a GPU/CI worker rather
-than during a local source checkout. The checked-in manuscript reports only
-results whose raw CSV and metadata are retained with the release.
+`requirements-experiments.txt` and should be run on a remote compute/CI worker
+rather than during a local source checkout. The checked-in manuscript reports
+only results whose raw CSV and metadata are retained with the release.
 
 The `AuditRegistry` also records each accepted protocol transition in an
 append-only, hash-linked `protocol_events` journal. Update and delete triggers

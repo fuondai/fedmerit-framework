@@ -19,6 +19,7 @@ from fedmerit.canonical import canonical_bytes
 from fedmerit.certificate import AuditRegistry, CertificateAuthority, Witness
 from fedmerit.conformance import run
 from fedmerit.gate import (
+    BeaconService,
     CommitProbeStore,
     RiskLedger,
     required_groups,
@@ -55,6 +56,16 @@ def _digest(label: str) -> str:
 
 
 class ReceiptEncodingTests(unittest.TestCase):
+    def test_linear_artifact_normalizes_identity_preprocessing(self) -> None:
+        implicit = LinearModelArtifact((0.25, -0.5, 0.1))
+        explicit = LinearModelArtifact(
+            (0.25, -0.5, 0.1),
+            feature_mean=(0.0, 0.0),
+            feature_scale=(1.0, 1.0),
+        )
+        self.assertEqual(implicit, explicit)
+        self.assertEqual(implicit.artifact_hash, explicit.artifact_hash)
+
     def test_contributor_root_binds_identity_update_and_weight(self) -> None:
         leaves = (
             ContributorLeaf("client-a", _digest("update-a"), 0.25),
@@ -374,6 +385,113 @@ class SealedCatalogConformanceTests(unittest.TestCase):
                     signed_frame=case["signed_frame"],
                     frame_public_key=case["frame_private_key"].public_key(),
                 )
+
+    def test_unobserved_signed_successor_cannot_fund_post_reveal_fixation(self) -> None:
+        """A successor signed off-path is not a pre-randomness reservation proof."""
+        with TemporaryDirectory(prefix="fedmerit-unobserved-successor-") as directory:
+            root = Path(directory)
+            case = _protocol_case(
+                root / "fixture",
+                name="unobserved-successor",
+                after_bias=2.0,
+                epsilon=0.10,
+                gamma=0.05,
+                alpha=0.10,
+            )
+            registry = AuditRegistry(
+                root / "attack-audit.sqlite3",
+                genesis_model=case["before"],
+                initial_context=case["context"],
+                evaluation_policy=case["policy"],
+                verification_trust=case["trust"],
+            )
+            registry.provision_lineage_risk_budget(0.9999)
+            ledger = RiskLedger(root / "attack-risk.sqlite3")
+            ledger.register(case["schedule"], audit_registry=registry)
+            ledger.observe_beacon_head(
+                case["signed_beacon_head"],
+                audit_registry=registry,
+                beacon_public_key=case["beacon_private_key"].public_key(),
+                signed_frame=case["signed_frame"],
+                frame_public_key=case["frame_private_key"].public_key(),
+            )
+
+            # The attack obtains a validly signed successor while both durable
+            # watchers still hold the parent, then conditions the candidate on
+            # its revealed randomness before calling consume.
+            premature = sign_beacon_round(
+                BeaconRound(
+                    case["frame"].beacon_id,
+                    case["candidate"].beacon_round,
+                    case["candidate"].beacon_parent_hash,
+                    hashlib.sha256(b"known-before-fixation").digest(),
+                ),
+                case["beacon_private_key"],
+            )
+            conditioned_bias = 3.0 if premature.round.randomness[0] & 1 else -3.0
+            conditioned = replace(
+                case["candidate"],
+                after_model=LinearModelArtifact((0.0, conditioned_bias)),
+            )
+            ledger.consume(
+                conditioned,
+                case["schedule"],
+                audit_registry=registry,
+                beacon_public_key=case["beacon_private_key"].public_key(),
+                signed_frame=case["signed_frame"],
+                frame_public_key=case["frame_private_key"].public_key(),
+            )
+            with self.assertRaisesRegex(ValueError, "frame-bound future round"):
+                case["store"].release(
+                    conditioned,
+                    signed_beacon_round=premature,
+                    beacon_public_key=case["beacon_private_key"].public_key(),
+                    schedule=case["schedule"],
+                    risk_ledger=ledger,
+                    audit_registry=registry,
+                )
+
+            # The same fixed candidate is releasable only through the durable
+            # reservation -> internal randomness -> finalized-round path.
+            service = BeaconService(
+                root / "attack-beacon.sqlite3",
+                beacon_id=case["frame"].beacon_id,
+                checkpoint=case["signed_beacon_head"],
+                private_key=case["beacon_private_key"],
+            )
+            reservation = service.reserve_fixation(
+                conditioned,
+                risk_ledger=ledger,
+            )
+            finalized = service.finalize_successor(reservation)
+            self.assertEqual(
+                finalized.round.fixation_hash,
+                conditioned.fixation_hash,
+            )
+            self.assertEqual(
+                service.reserve_fixation(conditioned, risk_ledger=ledger),
+                reservation,
+            )
+            self.assertEqual(service.finalize_successor(reservation), finalized)
+            reopened_service = BeaconService(
+                root / "attack-beacon.sqlite3",
+                beacon_id=case["frame"].beacon_id,
+                checkpoint=finalized,
+                private_key=case["beacon_private_key"],
+            )
+            self.assertEqual(
+                reopened_service.finalize_successor(reservation),
+                finalized,
+            )
+            release = case["store"].release(
+                conditioned,
+                signed_beacon_round=finalized,
+                beacon_public_key=service.public_key,
+                schedule=case["schedule"],
+                risk_ledger=ledger,
+                audit_registry=registry,
+            )
+            self.assertEqual(release.fixation_hash, conditioned.fixation_hash)
 
     def test_public_and_authorized_paths_are_distinct(self) -> None:
         self.assertTrue(self.result["public_receipt_verified_without_raw_probe"])
@@ -1265,6 +1383,7 @@ class ModelSuccessorTests(unittest.TestCase):
             reopened.handover(
                 state_context=handover,
                 evaluation_policy=case["policy"],
+                authorizer=case["authority"],
             )
             self.assertEqual(reopened.installed_model_version, successor.model_version)
             self.assertEqual(reopened.context_head[0], handover.context_hash)
@@ -1346,15 +1465,6 @@ class ModelSuccessorTests(unittest.TestCase):
             ledger.register(schedule, audit_registry=first["registry"])
             parent_round_hash = first["signed_beacon_round"].round.round_hash
             future_round_number = first["signed_beacon_round"].round.round_number + 1
-            future_round = sign_beacon_round(
-                BeaconRound(
-                    first["frame"].beacon_id,
-                    future_round_number,
-                    parent_round_hash,
-                    _digest("successor-beacon")[:64].encode("ascii")[:32],
-                ),
-                first["beacon_private_key"],
-            )
             candidate = Candidate(
                 context_hash=successor.context_hash,
                 state_context=successor,
@@ -1381,6 +1491,13 @@ class ModelSuccessorTests(unittest.TestCase):
                 beacon_public_key=first["beacon_private_key"].public_key(),
                 signed_frame=signed_successor_frame,
                 frame_public_key=first["frame_private_key"].public_key(),
+            )
+            fixation_reservation = first["beacon_service"].reserve_fixation(
+                candidate,
+                risk_ledger=ledger,
+            )
+            future_round = first["beacon_service"].finalize_successor(
+                fixation_reservation
             )
             successor_store = CommitProbeStore.successor(
                 first["store"],
@@ -1536,16 +1653,6 @@ class ModelSuccessorTests(unittest.TestCase):
             ledger.register(schedule, audit_registry=first["registry"])
             parent_round_hash = first["signed_beacon_round"].round.round_hash
             future_round_number = first["signed_beacon_round"].round.round_number + 1
-            future_round = sign_beacon_round(
-                BeaconRound(
-                    first["frame"].beacon_id,
-                    future_round_number,
-                    parent_round_hash,
-                    _digest("fresh-ledger-successor-beacon")[:64]
-                    .encode("ascii")[:32],
-                ),
-                first["beacon_private_key"],
-            )
             candidate = Candidate(
                 context_hash=successor.context_hash,
                 state_context=successor,
@@ -1572,6 +1679,13 @@ class ModelSuccessorTests(unittest.TestCase):
                 beacon_public_key=first["beacon_private_key"].public_key(),
                 signed_frame=signed_successor_frame,
                 frame_public_key=first["frame_private_key"].public_key(),
+            )
+            fixation_reservation = first["beacon_service"].reserve_fixation(
+                candidate,
+                risk_ledger=ledger,
+            )
+            future_round = first["beacon_service"].finalize_successor(
+                fixation_reservation
             )
             successor_store = CommitProbeStore.successor(
                 first["store"],
@@ -1632,6 +1746,7 @@ class ModelSuccessorTests(unittest.TestCase):
             first["registry"].handover(
                 state_context=successor,
                 evaluation_policy=first["policy"],
+                authorizer=first["authority"],
             )
 
             group_count = len(first["probes"][0].groups)
@@ -1697,16 +1812,6 @@ class ModelSuccessorTests(unittest.TestCase):
             )
             parent_round_hash = first["signed_beacon_round"].round.round_hash
             future_round_number = first["signed_beacon_round"].round.round_number + 1
-            future_round = sign_beacon_round(
-                BeaconRound(
-                    first["frame"].beacon_id,
-                    future_round_number,
-                    parent_round_hash,
-                    _digest("release-handover-successor-beacon")[:64]
-                    .encode("ascii")[:32],
-                ),
-                first["beacon_private_key"],
-            )
             candidate = Candidate(
                 context_hash=successor.context_hash,
                 state_context=successor,
@@ -1733,6 +1838,13 @@ class ModelSuccessorTests(unittest.TestCase):
                 beacon_public_key=first["beacon_private_key"].public_key(),
                 signed_frame=signed_successor_frame,
                 frame_public_key=first["frame_private_key"].public_key(),
+            )
+            fixation_reservation = first["beacon_service"].reserve_fixation(
+                candidate,
+                risk_ledger=ledger,
+            )
+            future_round = first["beacon_service"].finalize_successor(
+                fixation_reservation
             )
             successor_store = CommitProbeStore.successor(
                 first["store"],

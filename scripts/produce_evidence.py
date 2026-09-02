@@ -27,6 +27,7 @@ from fedmerit.certificate import (
     verify_receipt_bytes,
 )
 from fedmerit.gate import (
+    BeaconService,
     CommitProbeStore,
     RiskLedger,
     gate_decision,
@@ -351,15 +352,18 @@ def _protocol_case(
         signed_frame=signed_frame,
         frame_public_key=frame_private_key.public_key(),
     )
-    signed_beacon_round = sign_beacon_round(
-        BeaconRound(
-            beacon_id,
-            beacon_round_number,
-            signed_beacon_head.round.round_hash,
-            hashlib.sha256(f"{name}:registered-beacon-value".encode()).digest(),
-        ),
-        beacon_private_key,
+    beacon_service = BeaconService(
+        root / "beacon.sqlite3",
+        beacon_id=beacon_id,
+        checkpoint=signed_beacon_head,
+        private_key=beacon_private_key,
+        entropy_seed=hashlib.sha256(f"{name}:beacon-entropy".encode()).digest(),
     )
+    fixation_reservation = beacon_service.reserve_fixation(
+        candidate,
+        risk_ledger=ledger,
+    )
+    signed_beacon_round = beacon_service.finalize_successor(fixation_reservation)
     store = CommitProbeStore(
         probes,
         [partition],
@@ -378,6 +382,7 @@ def _protocol_case(
         "signed_frame": signed_frame,
         "frame_private_key": frame_private_key,
         "beacon_private_key": beacon_private_key,
+        "beacon_service": beacon_service,
         "signed_beacon_round": signed_beacon_round,
         "signed_beacon_head": signed_beacon_head,
         "partition": partition,
@@ -542,6 +547,7 @@ def _handover_rows() -> list[dict[str, Any]]:
                 registry.handover(
                     state_context=successor,
                     evaluation_policy=case["policy"],
+                    authorizer=case["authority"],
                 )
 
             if position == "before_release":
@@ -1069,6 +1075,7 @@ def _integrity_rows() -> list[dict[str, Any]]:
         case["registry"].handover(
             state_context=successor,
             evaluation_policy=case["policy"],
+            authorizer=case["authority"],
         )
         historical_replay = case["registry"].verify_and_append(
             receipt,

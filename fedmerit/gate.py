@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import secrets
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 
 from .canonical import canonical_bytes, digest, merkle_path, verify_merkle_path
 from .model import (
+    BeaconFixationReservation,
     BeaconRound,
     Candidate,
     CommitProbe,
@@ -34,8 +36,10 @@ from .model import (
     SignedSamplingFrame,
     SignedSamplingFrameCommitment,
     SignedBeaconRound,
+    SignedBeaconFixationReservation,
     SourcePartition,
     UINT32_MAX,
+    ZERO_HASH,
 )
 
 
@@ -737,16 +741,78 @@ def verify_sampling_frame_commitment(
 
 
 def _beacon_round_fields(round_value: BeaconRound) -> dict[str, object]:
-    return {"domain": "fedmerit-beacon-round-v1", "round": round_value}
+    return {"domain": "fedmerit-beacon-round-v2", "round": round_value}
+
+
+def _beacon_reservation_fields(
+    reservation: BeaconFixationReservation,
+) -> dict[str, object]:
+    return {
+        "domain": "fedmerit-beacon-fixation-reservation-v1",
+        "reservation": reservation,
+    }
+
+
+def _beacon_randomness(
+    entropy_secret: bytes,
+    signed_reservation: SignedBeaconFixationReservation,
+) -> bytes:
+    """Derive a successor value from service-held entropy, not public fields."""
+    return hashlib.sha256(
+        canonical_bytes(
+            {
+                "domain": "fedmerit-beacon-randomness-v2",
+                "entropy_secret": entropy_secret,
+                "reservation_hash": signed_reservation.reservation.reservation_hash,
+                "reservation_signature": signed_reservation.signature,
+            }
+        )
+    ).digest()
+
+
+def _sign_beacon_round(
+    round_value: BeaconRound,
+    private_key: Ed25519PrivateKey,
+    fixation_reservation: SignedBeaconFixationReservation | None = None,
+) -> SignedBeaconRound:
+    return SignedBeaconRound(
+        round_value,
+        private_key.sign(canonical_bytes(_beacon_round_fields(round_value))),
+        fixation_reservation,
+    )
 
 
 def sign_beacon_round(
     round_value: BeaconRound, private_key: Ed25519PrivateKey
 ) -> SignedBeaconRound:
-    return SignedBeaconRound(
-        round_value,
-        private_key.sign(canonical_bytes(_beacon_round_fields(round_value))),
-    )
+    """Sign an unreserved checkpoint/head observation.
+
+    Randomness-bearing successor rounds used for probe selection are deliberately
+    unavailable through this helper.  They must be produced by
+    :class:`BeaconService`, whose durable reservation precedes randomness
+    generation.
+    """
+    if round_value.fixation_hash != ZERO_HASH:
+        raise ValueError(
+            "post-fixation successor rounds must be finalized by BeaconService"
+        )
+    return _sign_beacon_round(round_value, private_key)
+
+
+def verify_beacon_fixation_reservation(
+    signed_reservation: SignedBeaconFixationReservation,
+    public_key: Ed25519PublicKey,
+) -> bool:
+    try:
+        public_key.verify(
+            signed_reservation.signature,
+            canonical_bytes(
+                _beacon_reservation_fields(signed_reservation.reservation)
+            ),
+        )
+    except InvalidSignature:
+        return False
+    return True
 
 
 def verify_beacon_round(
@@ -759,7 +825,336 @@ def verify_beacon_round(
         )
     except InvalidSignature:
         return False
-    return True
+    round_value = signed_round.round
+    if round_value.fixation_hash == ZERO_HASH:
+        return signed_round.fixation_reservation is None
+    reservation = signed_round.fixation_reservation
+    return bool(
+        reservation is not None
+        and verify_beacon_fixation_reservation(reservation, public_key)
+        and reservation.reservation.beacon_id == round_value.beacon_id
+        and reservation.reservation.round_number == round_value.round_number
+        and reservation.reservation.parent_round_hash
+        == round_value.previous_round_hash
+        and reservation.reservation.fixation_hash == round_value.fixation_hash
+        and reservation.reservation.reservation_hash
+        == round_value.reservation_hash
+    )
+
+
+class BeaconService:
+    """Durable two-phase beacon service for one authenticated hash chain.
+
+    ``reserve_fixation`` accepts only an allocation already consumed by the
+    durable risk ledger.  ``finalize_successor`` then generates randomness
+    internally, in the same transaction that marks the unique successor final.
+    The signed reservation travels with the round, so a release verifier can
+    check the pre-randomness fixation binding without trusting caller timing.
+    """
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        beacon_id: str,
+        checkpoint: SignedBeaconRound,
+        private_key: Ed25519PrivateKey | None = None,
+        entropy_seed: bytes | None = None,
+    ) -> None:
+        if str(path) == ":memory:":
+            raise ValueError("BeaconService must use durable storage, not :memory:")
+        if not isinstance(beacon_id, str) or not beacon_id.strip():
+            raise ValueError("beacon_id must be a non-empty string")
+        if private_key is not None and not isinstance(private_key, Ed25519PrivateKey):
+            raise TypeError("private_key must be an Ed25519 private key")
+        if entropy_seed is not None and (
+            not isinstance(entropy_seed, (bytes, bytearray))
+            or len(entropy_seed) != 32
+        ):
+            raise ValueError("entropy_seed must contain exactly 256 bits")
+        self.path = str(path)
+        self.beacon_id = beacon_id
+        provided_raw = None
+        if private_key is not None:
+            provided_raw = private_key.private_bytes(
+                serialization.Encoding.Raw,
+                serialization.PrivateFormat.Raw,
+                serialization.NoEncryption(),
+            )
+        with closing(self._connect()) as db:
+            db.executescript("""
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE IF NOT EXISTS beacon_service_key(
+                    id INTEGER PRIMARY KEY CHECK(id=1), private_key BLOB NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS beacon_service_entropy(
+                    id INTEGER PRIMARY KEY CHECK(id=1), entropy_secret BLOB NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS beacon_service_state(
+                    id INTEGER PRIMARY KEY CHECK(id=1), beacon_id TEXT NOT NULL,
+                    round_number INTEGER NOT NULL, round_hash TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS beacon_fixation_reservations(
+                    round_number INTEGER PRIMARY KEY,
+                    parent_round_hash TEXT NOT NULL,
+                    fixation_hash TEXT UNIQUE NOT NULL,
+                    reservation_signature BLOB NOT NULL,
+                    randomness BLOB,
+                    round_signature BLOB,
+                    round_hash TEXT
+                );
+            """)
+            key_row = db.execute(
+                "SELECT private_key FROM beacon_service_key WHERE id=1"
+            ).fetchone()
+            if key_row is None:
+                raw_key = provided_raw or Ed25519PrivateKey.generate().private_bytes(
+                    serialization.Encoding.Raw,
+                    serialization.PrivateFormat.Raw,
+                    serialization.NoEncryption(),
+                )
+                db.execute("INSERT INTO beacon_service_key VALUES(1,?)", (raw_key,))
+            else:
+                raw_key = bytes(key_row[0])
+                if provided_raw is not None and provided_raw != raw_key:
+                    raise ValueError("beacon service is bound to a different signing key")
+            service_key = Ed25519PrivateKey.from_private_bytes(raw_key)
+            entropy_row = db.execute(
+                "SELECT entropy_secret FROM beacon_service_entropy WHERE id=1"
+            ).fetchone()
+            provided_entropy = None if entropy_seed is None else bytes(entropy_seed)
+            if entropy_row is None:
+                entropy_secret = provided_entropy or secrets.token_bytes(32)
+                db.execute(
+                    "INSERT INTO beacon_service_entropy VALUES(1,?)",
+                    (entropy_secret,),
+                )
+            else:
+                entropy_secret = bytes(entropy_row[0])
+                if provided_entropy is not None and provided_entropy != entropy_secret:
+                    raise ValueError("beacon service is bound to different entropy")
+            if len(entropy_secret) != 32:
+                raise ValueError("stored beacon entropy must contain exactly 256 bits")
+            if (
+                checkpoint.round.beacon_id != beacon_id
+                or not verify_beacon_round(checkpoint, service_key.public_key())
+            ):
+                raise ValueError("beacon checkpoint is invalid for this service")
+            state = db.execute(
+                "SELECT beacon_id, round_number, round_hash "
+                "FROM beacon_service_state WHERE id=1"
+            ).fetchone()
+            checkpoint_state = (
+                beacon_id,
+                checkpoint.round.round_number,
+                checkpoint.round.round_hash,
+            )
+            if state is None:
+                db.execute(
+                    "INSERT INTO beacon_service_state VALUES(1,?,?,?)",
+                    checkpoint_state,
+                )
+            elif tuple(state) != checkpoint_state:
+                raise ValueError(
+                    "beacon checkpoint does not equal the durable service head"
+                )
+        self._private_key = Ed25519PrivateKey.from_private_bytes(raw_key)
+        self._entropy_secret = entropy_secret
+
+    @classmethod
+    def bootstrap(
+        cls,
+        path: str | Path,
+        *,
+        beacon_id: str,
+        checkpoint: BeaconRound,
+        private_key: Ed25519PrivateKey | None = None,
+        entropy_seed: bytes | None = None,
+    ) -> tuple["BeaconService", SignedBeaconRound]:
+        """Create a service and sign its checkpoint without exposing its key.
+
+        A caller that omits ``private_key`` receives only the public key through
+        the returned service.  ``private_key`` and ``entropy_seed`` are retained
+        solely for deterministic test fixtures and offline benchmark replays.
+        """
+        service_key = private_key or Ed25519PrivateKey.generate()
+        signed_checkpoint = _sign_beacon_round(checkpoint, service_key)
+        service = cls(
+            path,
+            beacon_id=beacon_id,
+            checkpoint=signed_checkpoint,
+            private_key=service_key,
+            entropy_seed=entropy_seed,
+        )
+        return service, signed_checkpoint
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.path, timeout=30, isolation_level=None)
+
+    @property
+    def public_key(self) -> Ed25519PublicKey:
+        return self._private_key.public_key()
+
+    def reserve_fixation(
+        self,
+        candidate: Candidate,
+        *,
+        risk_ledger: RiskLedger,
+    ) -> SignedBeaconFixationReservation:
+        """Sign and persist the candidate binding before randomness exists."""
+        if not isinstance(risk_ledger, RiskLedger):
+            raise TypeError("risk_ledger must be a RiskLedger")
+        if not risk_ledger.fixation_precedes_beacon(candidate):
+            raise ValueError("candidate must be durably fixed before beacon reservation")
+        reservation = BeaconFixationReservation(
+            self.beacon_id,
+            candidate.beacon_round,
+            candidate.beacon_parent_hash,
+            candidate.fixation_hash,
+        )
+        fields = canonical_bytes(_beacon_reservation_fields(reservation))
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            state = db.execute(
+                "SELECT beacon_id, round_number, round_hash "
+                "FROM beacon_service_state WHERE id=1"
+            ).fetchone()
+            row = db.execute(
+                "SELECT parent_round_hash, fixation_hash, reservation_signature "
+                "FROM beacon_fixation_reservations WHERE round_number=?",
+                (candidate.beacon_round,),
+            ).fetchone()
+            if row is not None:
+                if (str(row[0]), str(row[1])) != (
+                    candidate.beacon_parent_hash,
+                    candidate.fixation_hash,
+                ):
+                    db.rollback()
+                    raise ValueError("beacon successor is reserved for another fixation")
+                signature = bytes(row[2])
+            else:
+                if state != (
+                    self.beacon_id,
+                    candidate.beacon_round - 1,
+                    candidate.beacon_parent_hash,
+                ):
+                    db.rollback()
+                    raise ValueError("candidate does not extend the durable beacon head")
+                signature = self._private_key.sign(fields)
+                try:
+                    db.execute(
+                        "INSERT INTO beacon_fixation_reservations"
+                        "(round_number,parent_round_hash,fixation_hash,"
+                        "reservation_signature,randomness,round_signature,round_hash) "
+                        "VALUES(?,?,?,?,NULL,NULL,NULL)",
+                        (
+                            candidate.beacon_round,
+                            candidate.beacon_parent_hash,
+                            candidate.fixation_hash,
+                            signature,
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    db.rollback()
+                    raise ValueError(
+                        "fixation is already bound to another beacon successor"
+                    ) from exc
+            db.commit()
+        return SignedBeaconFixationReservation(reservation, signature)
+
+    def finalize_successor(
+        self,
+        signed_reservation: SignedBeaconFixationReservation,
+    ) -> SignedBeaconRound:
+        """Generate and finalize the unique successor for a durable reservation."""
+        if not verify_beacon_fixation_reservation(
+            signed_reservation, self.public_key
+        ):
+            raise ValueError("beacon fixation reservation signature is invalid")
+        reservation = signed_reservation.reservation
+        if reservation.beacon_id != self.beacon_id:
+            raise ValueError("beacon reservation belongs to another service")
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            state = db.execute(
+                "SELECT beacon_id, round_number, round_hash "
+                "FROM beacon_service_state WHERE id=1"
+            ).fetchone()
+            row = db.execute(
+                "SELECT parent_round_hash, fixation_hash, reservation_signature,"
+                "randomness,round_signature,round_hash "
+                "FROM beacon_fixation_reservations WHERE round_number=?",
+                (reservation.round_number,),
+            ).fetchone()
+            expected_state = (
+                self.beacon_id,
+                reservation.round_number - 1,
+                reservation.parent_round_hash,
+            )
+            if row is None or (
+                str(row[0]), str(row[1]), bytes(row[2])
+            ) != (
+                reservation.parent_round_hash,
+                reservation.fixation_hash,
+                signed_reservation.signature,
+            ):
+                db.rollback()
+                raise ValueError("beacon reservation is absent from durable state")
+            if row[3] is not None:
+                randomness = bytes(row[3])
+                round_signature = bytes(row[4])
+                expected_round_hash = str(row[5])
+            else:
+                if tuple(state) != expected_state:
+                    db.rollback()
+                    raise ValueError("beacon reservation no longer extends the live head")
+                randomness = _beacon_randomness(
+                    self._entropy_secret,
+                    signed_reservation,
+                )
+                round_value = BeaconRound(
+                    reservation.beacon_id,
+                    reservation.round_number,
+                    reservation.parent_round_hash,
+                    randomness,
+                    reservation.fixation_hash,
+                    reservation.reservation_hash,
+                )
+                round_signature = self._private_key.sign(
+                    canonical_bytes(_beacon_round_fields(round_value))
+                )
+                expected_round_hash = round_value.round_hash
+                db.execute(
+                    "UPDATE beacon_fixation_reservations SET randomness=?,"
+                    "round_signature=?,round_hash=? WHERE round_number=?",
+                    (
+                        randomness,
+                        round_signature,
+                        expected_round_hash,
+                        reservation.round_number,
+                    ),
+                )
+                db.execute(
+                    "UPDATE beacon_service_state SET round_number=?,round_hash=? "
+                    "WHERE id=1",
+                    (reservation.round_number, expected_round_hash),
+                )
+            db.commit()
+        round_value = BeaconRound(
+            reservation.beacon_id,
+            reservation.round_number,
+            reservation.parent_round_hash,
+            randomness,
+            reservation.fixation_hash,
+            reservation.reservation_hash,
+        )
+        if round_value.round_hash != expected_round_hash:
+            raise ValueError("durable beacon transcript hash is inconsistent")
+        return SignedBeaconRound(
+            round_value,
+            round_signature,
+            signed_reservation,
+        )
 
 
 def _raw_public_key(public_key: Ed25519PublicKey) -> bytes:
@@ -1214,6 +1609,7 @@ class CommitProbeStore:
             or beacon_round.beacon_id != self._signed_frame.frame.beacon_id
             or beacon_round.round_number != candidate.beacon_round
             or beacon_round.previous_round_hash != candidate.beacon_parent_hash
+            or beacon_round.fixation_hash != candidate.fixation_hash
             or not verify_beacon_round(signed_beacon_round, beacon_public_key)
         ):
             raise ValueError("beacon transcript is not the frame-bound future round")
@@ -1505,6 +1901,7 @@ def verify_public_release(
         or beacon_round.beacon_id != frame.beacon_id
         or beacon_round.round_number != candidate.beacon_round
         or beacon_round.previous_round_hash != candidate.beacon_parent_hash
+        or beacon_round.fixation_hash != candidate.fixation_hash
         or not verify_beacon_round(release.signed_beacon_round, beacon_public_key)
     ):
         return False

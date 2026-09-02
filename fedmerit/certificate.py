@@ -12,6 +12,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Sequence
 
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
@@ -122,6 +123,132 @@ class VerificationTrust:
         )
 
 
+def _handover_fields(
+    *,
+    previous_context_hash: str,
+    successor_context: StateContext,
+    previous_receipt_hash: str,
+    installed_model_hash: str,
+    installed_model_version: int,
+    roster_epoch: int,
+) -> dict[str, object]:
+    return {
+        "domain": "fedmerit-context-handover-v1",
+        "previous_context_hash": previous_context_hash,
+        "successor_context": successor_context,
+        "previous_receipt_hash": previous_receipt_hash,
+        "installed_model_hash": installed_model_hash,
+        "installed_model_version": installed_model_version,
+        "roster_epoch": roster_epoch,
+    }
+
+
+@dataclass(frozen=True)
+class HandoverAuthorization:
+    """Old-roster quorum authorization for one immediate context successor."""
+
+    previous_context_hash: str
+    successor_context: StateContext
+    previous_receipt_hash: str
+    installed_model_hash: str
+    installed_model_version: int
+    roster_epoch: int
+    witness_count: int
+    signatures: tuple[WitnessSignature, ...]
+
+    def __post_init__(self) -> None:
+        for name in (
+            "previous_context_hash",
+            "previous_receipt_hash",
+            "installed_model_hash",
+        ):
+            _require_digest(getattr(self, name), name)
+        for name in ("installed_model_version", "roster_epoch", "witness_count"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                or value >= 1 << 32
+            ):
+                raise ValueError(f"{name} must be uint32")
+        if self.witness_count == 0:
+            raise ValueError("handover witness_count must be positive")
+        signatures = tuple(self.signatures)
+        object.__setattr__(self, "signatures", signatures)
+        if (
+            any(not isinstance(item, WitnessSignature) for item in signatures)
+        ):
+            raise ValueError("handover signatures must contain witness signatures")
+        indices = tuple(item.witness_index for item in signatures)
+        if (
+            indices != tuple(sorted(indices))
+            or len(indices) != len(set(indices))
+            or any(index >= self.witness_count for index in indices)
+        ):
+            raise ValueError("handover signatures need distinct ascending roster indices")
+
+    @property
+    def signing_bytes(self) -> bytes:
+        return canonical_bytes(
+            _handover_fields(
+                previous_context_hash=self.previous_context_hash,
+                successor_context=self.successor_context,
+                previous_receipt_hash=self.previous_receipt_hash,
+                installed_model_hash=self.installed_model_hash,
+                installed_model_version=self.installed_model_version,
+                roster_epoch=self.roster_epoch,
+            )
+        )
+
+    @property
+    def authorization_hash(self) -> str:
+        return hashlib.sha256(self.signing_bytes).hexdigest()
+
+
+def verify_handover_authorization(
+    authorization: HandoverAuthorization,
+    trust: VerificationTrust,
+) -> bool:
+    """Verify that at least 2f+1 old-roster members signed one transition."""
+    if (
+        authorization.roster_epoch != trust.roster_epoch
+        or authorization.witness_count != len(trust.witness_public_keys)
+        or len(authorization.signatures) < 2 * trust.f + 1
+    ):
+        return False
+    seen: set[int] = set()
+    try:
+        for item in authorization.signatures:
+            if item.witness_index in seen:
+                return False
+            key = Ed25519PublicKey.from_public_bytes(
+                trust.witness_public_keys[item.witness_index]
+            )
+            key.verify(item.signature, authorization.signing_bytes)
+            seen.add(item.witness_index)
+    except (IndexError, InvalidSignature, ValueError):
+        return False
+    return len(seen) >= 2 * trust.f + 1
+
+
+def _verification_trust_from_blob(payload: bytes) -> VerificationTrust:
+    """Decode the canonical trust record stored by ``AuditRegistry``."""
+    try:
+        value = json.loads(payload)
+        return VerificationTrust(
+            f=int(value["f"]),
+            witness_public_keys=tuple(
+                bytes.fromhex(item["hex"]) for item in value["witness_public_keys"]
+            ),
+            store_public_key=bytes.fromhex(value["store_public_key"]["hex"]),
+            frame_public_key=bytes.fromhex(value["frame_public_key"]["hex"]),
+            roster_epoch=int(value["roster_epoch"]),
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("stored verification trust has invalid canonical bytes") from exc
+
+
 def _replay_core(
     candidate: Candidate,
     release: ProbeRelease,
@@ -207,6 +334,10 @@ class Witness:
                     previous_receipt_hash TEXT NOT NULL, receipt_hash TEXT NOT NULL,
                     PRIMARY KEY(context_hash, before_model_hash, previous_receipt_hash)
                 );
+                CREATE TABLE IF NOT EXISTS signed_handovers(
+                    previous_context_hash TEXT PRIMARY KEY,
+                    authorization_hash TEXT NOT NULL
+                );
             """)
             row = db.execute(
                 "SELECT witness_index, private_key FROM witness_key WHERE id=1"
@@ -266,6 +397,41 @@ class Witness:
             db.commit()
         return WitnessSignature(
             self.witness_index, self.private_key.sign(core.to_bytes())
+        )
+
+    def authorize_handover(self, signing_bytes: bytes) -> WitnessSignature:
+        """Sign at most one successor transition from a context head."""
+        try:
+            fields = json.loads(signing_bytes)
+            if canonical_bytes(fields) != bytes(signing_bytes):
+                raise ValueError("handover authorization is not canonically encoded")
+            if fields.get("domain") != "fedmerit-context-handover-v1":
+                raise ValueError("handover authorization domain is invalid")
+            previous_context_hash = str(fields["previous_context_hash"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("handover authorization has invalid canonical bytes") from exc
+        _require_digest(previous_context_hash, "previous_context_hash")
+        authorization_hash = hashlib.sha256(signing_bytes).hexdigest()
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            prior = db.execute(
+                "SELECT authorization_hash FROM signed_handovers "
+                "WHERE previous_context_hash=?",
+                (previous_context_hash,),
+            ).fetchone()
+            if prior is not None and str(prior[0]) != authorization_hash:
+                db.rollback()
+                raise ValueError(
+                    "witness refuses conflicting handovers from one context head"
+                )
+            db.execute(
+                "INSERT OR IGNORE INTO signed_handovers VALUES(?,?)",
+                (previous_context_hash, authorization_hash),
+            )
+            db.commit()
+        return WitnessSignature(
+            self.witness_index,
+            self.private_key.sign(signing_bytes),
         )
 
     def attest(
@@ -410,6 +576,49 @@ class CertificateAuthority:
             verification_trust=trust,
         )
         return receipt
+
+    def authorize_handover(
+        self,
+        *,
+        previous_context_hash: str,
+        successor_context: StateContext,
+        previous_receipt_hash: str,
+        installed_model_hash: str,
+        installed_model_version: int,
+    ) -> HandoverAuthorization:
+        """Collect an old-roster quorum over one fully bound handover tuple."""
+        fields = _handover_fields(
+            previous_context_hash=previous_context_hash,
+            successor_context=successor_context,
+            previous_receipt_hash=previous_receipt_hash,
+            installed_model_hash=installed_model_hash,
+            installed_model_version=installed_model_version,
+            roster_epoch=self.roster_epoch,
+        )
+        payload = canonical_bytes(fields)
+        threshold = 2 * self.f + 1
+        signatures: list[WitnessSignature] = []
+        for witness in self.witnesses:
+            try:
+                signature = witness.authorize_handover(payload)
+                witness.public_key.verify(signature.signature, payload)
+            except Exception:
+                continue
+            signatures.append(signature)
+            if len(signatures) == threshold:
+                break
+        if len(signatures) < threshold:
+            raise ValueError("fewer than 2f+1 witnesses authorized the handover")
+        return HandoverAuthorization(
+            previous_context_hash,
+            successor_context,
+            previous_receipt_hash,
+            installed_model_hash,
+            installed_model_version,
+            self.roster_epoch,
+            len(self.witnesses),
+            tuple(sorted(signatures, key=lambda item: item.witness_index)),
+        )
 
 
 def _core_matches_candidate(
@@ -1685,10 +1894,22 @@ class AuditRegistry:
         state_context: StateContext,
         evaluation_policy: EvaluationPolicy,
         verification_trust: VerificationTrust | None = None,
+        authorization: HandoverAuthorization | None = None,
+        authorizer: CertificateAuthority | None = None,
     ) -> None:
-        """Atomically replace the live authority head before a new append."""
+        """Atomically replace the live authority head after old-roster approval."""
         if state_context.policy_hash != evaluation_policy.policy_hash:
             raise ValueError("successor context does not authorize its policy")
+        if authorization is not None and authorizer is not None:
+            raise ValueError("supply authorization or authorizer, not both")
+        if authorization is None and authorizer is not None:
+            authorization = authorizer.authorize_handover(
+                previous_context_hash=self.context_head[0],
+                successor_context=state_context,
+                previous_receipt_hash=self.head,
+                installed_model_hash=self.installed_model_hash,
+                installed_model_version=self.installed_model_version,
+            )
         policy_blob = canonical_bytes(evaluation_policy)
         with closing(self._connect()) as db:
             db.execute("BEGIN IMMEDIATE")
@@ -1708,15 +1929,55 @@ class AuditRegistry:
                 raise ValueError(
                     "handover requires the immediate successor state version"
                 )
-            installed_model_version = int(
-                db.execute(
-                    "SELECT installed_model_version FROM audit_state WHERE id=1"
-                ).fetchone()[0]
-            )
+            audit_state = db.execute(
+                "SELECT head, installed_model_hash, installed_model_version "
+                "FROM audit_state WHERE id=1"
+            ).fetchone()
+            previous_receipt_hash = str(audit_state[0])
+            installed_model_hash = str(audit_state[1])
+            installed_model_version = int(audit_state[2])
             if state_context.model_version != installed_model_version:
                 db.rollback()
                 raise ValueError(
                     "handover model version must equal the installed model version"
+                )
+            old_trust_row = db.execute(
+                "SELECT trust_blob FROM verification_trust WHERE context_hash=?",
+                (live_context_hash,),
+            ).fetchone()
+            if old_trust_row is not None:
+                if authorization is None:
+                    db.rollback()
+                    raise ValueError(
+                        "live context requires an old-roster handover authorization"
+                    )
+                expected_authorization = (
+                    str(live_context_hash),
+                    state_context,
+                    previous_receipt_hash,
+                    installed_model_hash,
+                    installed_model_version,
+                )
+                actual_authorization = (
+                    authorization.previous_context_hash,
+                    authorization.successor_context,
+                    authorization.previous_receipt_hash,
+                    authorization.installed_model_hash,
+                    authorization.installed_model_version,
+                )
+                old_trust = _verification_trust_from_blob(bytes(old_trust_row[0]))
+                if (
+                    actual_authorization != expected_authorization
+                    or not verify_handover_authorization(authorization, old_trust)
+                ):
+                    db.rollback()
+                    raise ValueError(
+                        "handover authorization does not bind the live transition"
+                    )
+            elif authorization is not None:
+                db.rollback()
+                raise ValueError(
+                    "handover authorization cannot be checked without prior trust roots"
                 )
             lineage_caps = db.execute(
                 "SELECT twin_id, profile_blob FROM lineage_security_caps WHERE id=1"
@@ -1809,6 +2070,11 @@ class AuditRegistry:
                     "twin_id": state_context.twin_id,
                     "state_version": state_context.state_version,
                     "model_version": state_context.model_version,
+                    "authorization_hash": (
+                        None
+                        if authorization is None
+                        else authorization.authorization_hash
+                    ),
                 },
             )
             db.commit()
