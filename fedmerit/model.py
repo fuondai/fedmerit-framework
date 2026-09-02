@@ -64,7 +64,11 @@ def _binary64(name: str, value: float) -> float:
 
 @dataclass(frozen=True)
 class SecurityProfile:
-    """Finite lifetime/query caps used by the computational reduction."""
+    """Finite caps used by the computational reduction.
+
+    ``max_hash_queries`` is charged per attempted certificate; the remaining
+    query caps are lifetime totals unless their name explicitly says otherwise.
+    """
 
     security_parameter_bits: int = 256
     max_attempts: int = 1_000

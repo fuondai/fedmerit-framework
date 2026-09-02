@@ -74,7 +74,7 @@ def reference_computational_bound(
 ) -> ComputationalBound:
     """Instantiate the paper's finite-query reduction with exact rationals.
 
-    ``max_hash_queries`` is the total random-oracle work available against all
+    ``max_hash_queries`` is the random-oracle work available per attempt across
     salted probe openings. ``max_collision_queries`` is the total number of
     distinct SHA-256 inputs. ``max_signature_queries`` and
     ``max_beacon_queries`` are total lifetime attempts against the registered
