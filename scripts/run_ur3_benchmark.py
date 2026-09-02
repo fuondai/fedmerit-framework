@@ -1,10 +1,12 @@
-"""End-to-end FedMERIT benchmark on the UCI UR3 CobotOps dataset.
+"""FedMERIT candidate-transition benchmark on the UCI UR3 CobotOps dataset.
 
 The benchmark treats operation cycles as non-IID source groups. Proposal,
 validation, commit-probe, and audit cycles are disjoint for every seed. Every
-candidate is evaluated through a signed sealed frame, a post-fixation beacon,
-one-use risk consumption, 2f+1 witness replay, and atomic ``CheckAppend``. Raw
-metrics are read back from the resulting receipt and installed serving state.
+method starts from the same benign FedAvg checkpoint and produces one candidate
+transition under the same client messages. Each candidate is then evaluated
+through a signed sealed frame, a post-fixation beacon, one-use risk consumption,
+2f+1 witness replay, and atomic ``CheckAppend``. Raw metrics are read back from
+the resulting receipt and installed serving state.
 """
 
 from __future__ import annotations
@@ -13,11 +15,13 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import platform
 import secrets
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Callable
@@ -100,6 +104,30 @@ COMMIT_POOL_GROUPS = 80
 MIN_AUDIT_GROUPS = 20
 SPLIT_MODES = ("random", "blocked")
 ATTACK_QUERIES = 64
+
+
+def _installed_version(distribution: str) -> str:
+    try:
+        return version(distribution)
+    except PackageNotFoundError:
+        return "not-installed"
+
+
+def _fault_configuration(
+    attack: str, *, clients_per_round: int, byzantine_fraction: float
+) -> tuple[int, int]:
+    """Return the registered fault bound and the injected faulty-client count.
+
+    Robust rules receive the same registered upper bound in every condition.
+    The clean condition injects no malicious clients; it does not reveal that
+    fact to Krum or FoundationFL by silently changing their configuration.
+    """
+
+    if attack not in {"none", "sign_flip", "model_replacement", "score_aware"}:
+        raise ValueError(f"unknown attack: {attack}")
+    configured = max(1, int(math.floor(clients_per_round * byzantine_fraction)))
+    actual = 0 if attack == "none" else configured
+    return configured, actual
 
 
 @dataclass(frozen=True)
@@ -1157,13 +1185,16 @@ def _run_seed(
     output = []
     for attack in ("none", "sign_flip", "model_replacement", "score_aware"):
         updates = benign_updates_array.copy()
-        fault_count = (
-            0
-            if attack == "none"
-            else max(1, int(math.floor(clients_per_round * byzantine_fraction)))
+        configured_fault_bound, actual_fault_count = _fault_configuration(
+            attack,
+            clients_per_round=clients_per_round,
+            byzantine_fraction=byzantine_fraction,
         )
-        if fault_count:
-            malicious = rng.choice(clients_per_round, fault_count, replace=False)
+        malicious = np.asarray([], dtype=int)
+        if actual_fault_count:
+            malicious = rng.choice(
+                clients_per_round, actual_fault_count, replace=False
+            )
             if attack == "sign_flip":
                 updates[malicious] = -6.0 * updates[malicious]
             elif attack == "model_replacement":
@@ -1182,7 +1213,7 @@ def _run_seed(
                     before=weights,
                     updates=client_updates,
                     sizes=sizes_array,
-                    faults=fault_count,
+                    faults=configured_fault_bound,
                     root_update=score_update,
                     score_x=score_eval_x,
                     score_y=score_eval_y,
@@ -1275,6 +1306,8 @@ def _run_seed(
                     "attack_queries": ATTACK_QUERIES if attack == "score_aware" else 0,
                     "selected_attack_query": selected_query,
                     "attack_score_feasible": int(attack_score_feasible),
+                    "configured_fault_bound": configured_fault_bound,
+                    "actual_byzantine_clients": actual_fault_count,
                     "accepted": int(accepted),
                     "commit_delta": commit_delta,
                     "audit_delta": audit_delta,
@@ -1404,6 +1437,7 @@ def main() -> None:
     parser.add_argument("--clients-per-round", type=int, default=30)
     parser.add_argument("--byzantine-fraction", type=float, default=0.20)
     parser.add_argument("--split", choices=SPLIT_MODES, default="random")
+    parser.add_argument("--run-label", default="")
     args = parser.parse_args()
     seeds = tuple(int(value) for value in args.seeds.split(",") if value.strip())
     if not seeds or args.pretrain_rounds <= 0 or args.clients_per_round <= 6:
@@ -1475,10 +1509,27 @@ def main() -> None:
         "split": args.split,
         "environment": {
             "python": platform.python_version(),
+            "python_implementation": platform.python_implementation(),
             "numpy": np.__version__,
             "pandas": pd.__version__,
             "scipy": scipy.__version__,
+            "scikit_learn": _installed_version("scikit-learn"),
+            "openpyxl": _installed_version("openpyxl"),
+            "cryptography": _installed_version("cryptography"),
             "platform": platform.platform(),
+            "machine": platform.machine(),
+            "logical_cpu_count": os.cpu_count(),
+        },
+        "benchmark_design": {
+            "estimand": "one installed candidate transition from a shared checkpoint",
+            "shared_checkpoint": "20 benign FedAvg rounds per seed",
+            "candidate_rounds_per_method_attack_seed": 1,
+            "end_to_end_training_comparison": False,
+            "registered_fault_bound": max(
+                1, int(math.floor(args.clients_per_round * args.byzantine_fraction))
+            ),
+            "clean_actual_byzantine_clients": 0,
+            "run_label": args.run_label,
         },
         "split_groups_per_seed": {
             "proposal": 110,

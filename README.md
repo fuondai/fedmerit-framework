@@ -39,6 +39,9 @@ python3 -m fedmerit.conformance
 The conformance command exits nonzero if any catalog, beacon, release, replay,
 handover, quorum, or receipt check fails.
 
+The explicit adversary interfaces, persistent-state boundary, beacon experiment,
+and winning event are recorded in `docs/SECURITY_GAME.md`.
+
 Run the deterministic regression suite from the repository root:
 
 ```bash
@@ -118,20 +121,18 @@ cumulative caps on certificate attempts, distinct verification keys, and context
 handovers. Existing roots are counted before acceptance; later key rotation or
 handover fails before exceeding its cap.
 
-## Reproducible workload benchmark
+## Reproducible candidate-transition benchmark
 
 `scripts/run_ur3_benchmark.py` is an optional experiment driver for the UCI
 UR3 CobotOps workbook (DOI `10.24432/C5J891`). It treats operation cycles as
 non-IID groups and keeps proposal, score, sealed-catalog, and audit groups
-disjoint. The fixed v3 split uses 110 proposal, 30 score, 80 catalog-pool
-(76 sealed), and 20 held-out audit cycles; `--split blocked` repeats the same
-protocol with chronological rather than random partitioning. The driver
-compares FedAvg, coordinate median, Krum, FLTrust, FedVal, FLShield, and
-FoundationFL under clean, sign-flip, model-replacement, and a bounded
-64-query score-aware attack (the latter is run for methods for which its
-aggregate oracle is defined). FedVal and the trusted root use a deterministic
-equal-class view of the score rows; the complete score groups remain committed
-and visible to the diagnostic attack.
+disjoint. The fixed split uses 110 proposal, 30 score, 76 catalog, and 20
+held-out audit cycles; `--split blocked` repeats the same protocol with
+chronological rather than random partitioning. Every method receives the same
+20-round benign FedAvg checkpoint and produces one candidate transition. This
+is a controlled candidate-generator comparison, not seven end-to-end training
+runs. The exact adaptations, attack visibility, and metric semantics are listed
+in `docs/BENCHMARK_CONTRACT.md`.
 
 Each candidate first receives its unguarded audit score and then runs through an
 isolated end-to-end FedMERIT instance: signed frame, finite risk schedule,

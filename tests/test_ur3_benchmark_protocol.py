@@ -4,7 +4,12 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from fedmerit import EvaluationPolicy, LinearModelArtifact
+from fedmerit import (
+    EvaluationPolicy,
+    LinearModelArtifact,
+    ProbeGroup,
+    paired_model_loss_difference_exact,
+)
 from scripts.run_ur3_benchmark import (
     COMMIT_GROUPS,
     CycleGroup,
@@ -12,6 +17,7 @@ from scripts.run_ur3_benchmark import (
     _fltrust,
     _fedval,
     _foundationfl,
+    _fault_configuration,
     _balanced_binary_rows,
     _mean_ci,
     _score_aware_updates,
@@ -219,3 +225,39 @@ def test_balanced_validation_view_is_deterministic_and_source_ordered() -> None:
 def test_balanced_validation_view_rejects_single_class() -> None:
     with pytest.raises(ValueError, match="both labels"):
         _balanced_binary_rows(np.ones((3, 2)), np.ones(3, dtype=int))
+
+
+def test_registered_fault_bound_does_not_leak_clean_attack_label() -> None:
+    clean_bound, clean_actual = _fault_configuration(
+        "none", clients_per_round=30, byzantine_fraction=0.20
+    )
+    attack_bound, attack_actual = _fault_configuration(
+        "model_replacement", clients_per_round=30, byzantine_fraction=0.20
+    )
+    assert clean_bound == attack_bound == 6
+    assert clean_actual == 0
+    assert attack_actual == 6
+
+
+def test_reused_score_can_accept_when_fresh_probe_rejects() -> None:
+    before = LinearModelArtifact((0.0, 0.0, 0.0))
+    score_conditioned = LinearModelArtifact((4.0, 4.0, 0.0))
+    score = (
+        ProbeGroup("score", "0" * 64, ((1.0, 0.0),), (1,)),
+    )
+    fresh = (
+        ProbeGroup("fresh", "1" * 64, ((0.0, 1.0),), (0,)),
+    )
+    policy = EvaluationPolicy("brier-decimal80-v1")
+
+    reused_delta = paired_model_loss_difference_exact(
+        before, score_conditioned, score, policy
+    )
+    fresh_delta = paired_model_loss_difference_exact(
+        before, score_conditioned, fresh, policy
+    )
+
+    assert reused_delta < 0
+    assert fresh_delta > 0
+    assert float(reused_delta) == pytest.approx(-0.249676496251, abs=1e-12)
+    assert float(fresh_delta) == pytest.approx(0.714351083825, abs=1e-12)
