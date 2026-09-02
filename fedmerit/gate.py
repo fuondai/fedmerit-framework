@@ -971,11 +971,12 @@ class BeaconService:
         private_key: Ed25519PrivateKey | None = None,
         entropy_seed: bytes | None = None,
     ) -> tuple["BeaconService", SignedBeaconRound]:
-        """Create a service and sign its checkpoint without exposing its key.
+        """Create a service and sign its checkpoint in one operation.
 
-        A caller that omits ``private_key`` receives only the public key through
-        the returned service.  ``private_key`` and ``entropy_seed`` are retained
-        solely for deterministic test fixtures and offline benchmark replays.
+        The service keeps the signing key in its durable boundary and exposes
+        only ``public_key`` as part of its supported API.  ``private_key`` and
+        ``entropy_seed`` are retained solely for deterministic test fixtures and
+        offline benchmark replays.
         """
         service_key = private_key or Ed25519PrivateKey.generate()
         signed_checkpoint = _sign_beacon_round(checkpoint, service_key)
