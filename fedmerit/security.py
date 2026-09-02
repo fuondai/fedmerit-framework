@@ -1,9 +1,8 @@
 """Concrete reference bounds for the FedMERIT computational reduction.
 
-The protocol paper states its reduction in terms of total lifetime query caps.
-This module makes the corresponding reference-profile calculation executable.
-It does not estimate empirical cryptanalytic strength: the Ed25519 and beacon
-terms are explicit assumptions supplied by the deployment security profile.
+This module expands the registered per-leaf, per-key, and per-successor query
+caps over one finite lineage. It does not estimate empirical cryptanalytic
+strength: the Ed25519 and beacon terms are explicit deployment assumptions.
 """
 
 from __future__ import annotations
@@ -74,13 +73,11 @@ def reference_computational_bound(
 ) -> ComputationalBound:
     """Instantiate the paper's finite-query reduction with exact rationals.
 
-    ``max_hash_queries`` is the random-oracle work available per attempt across
-    salted probe openings. ``max_collision_queries`` is the total number of
-    distinct SHA-256 inputs. ``max_signature_queries`` and
-    ``max_beacon_queries`` are total lifetime attempts against the registered
-    Ed25519 and threshold-beacon contracts. The latter two terms therefore use
-    the explicitly declared 128-bit reference assumptions rather than an
-    undocumented constant hidden in prose.
+    ``max_hash_queries`` is a per-leaf random-oracle query cap.  The reduction
+    charges every attempt and every registered catalog leaf, then includes those
+    hiding queries in the one SHA-256 collision universe.  Signature queries are
+    capped per authorized key and beacon queries per successor challenge; the
+    profile's key and handover caps make those resources lineage-scoped.
     """
     for name, bits in (
         ("signature_security_bits", signature_security_bits),
@@ -90,20 +87,24 @@ def reference_computational_bound(
             raise ValueError(f"{name} must be a positive integer")
 
     digest_space = 1 << profile.security_parameter_bits
+    hiding_query_work = (
+        profile.max_attempts * profile.max_catalog_leaves * profile.max_hash_queries
+    )
+    total_hash_queries = hiding_query_work + profile.max_collision_queries
     probe_hiding = Fraction(
-        profile.max_attempts * profile.max_hash_queries,
+        hiding_query_work,
         digest_space,
     )
     hash_collision = Fraction(
-        profile.max_collision_queries * (profile.max_collision_queries - 1),
+        total_hash_queries * (total_hash_queries - 1),
         2 * digest_space,
     )
     signature_forgery = Fraction(
-        profile.max_signature_queries,
+        profile.max_verification_keys * profile.max_signature_queries,
         1 << signature_security_bits,
     )
     beacon_bias = Fraction(
-        profile.max_beacon_queries,
+        profile.max_attempts * profile.max_beacon_queries,
         1 << beacon_bias_security_bits,
     )
     bound = ComputationalBound(

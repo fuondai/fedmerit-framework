@@ -203,6 +203,7 @@ def validate_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
             "max_collision_queries",
             "max_signature_queries",
             "max_beacon_queries",
+            "max_handover_count",
         },
         "evaluation_policy.security_profile",
     )

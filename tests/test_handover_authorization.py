@@ -14,15 +14,23 @@ from fedmerit.certificate import (
     VerificationTrust,
     verify_handover_authorization,
 )
-from fedmerit.model import EvaluationPolicy, LinearModelArtifact, StateContext
+from fedmerit.model import (
+    EvaluationPolicy,
+    LinearModelArtifact,
+    SecurityProfile,
+    StateContext,
+)
 
 
 def _digest(label: str) -> str:
     return hashlib.sha256(label.encode("ascii")).hexdigest()
 
 
-def _fixture(tmp_path):
-    policy = EvaluationPolicy("handover-policy")
+def _fixture(tmp_path, *, security_profile: SecurityProfile | None = None):
+    policy = EvaluationPolicy(
+        "handover-policy",
+        security_profile=security_profile or SecurityProfile(),
+    )
     model = LinearModelArtifact((0.0, 0.0))
     authority = CertificateAuthority.persistent(tmp_path / "witnesses", f=1)
     store = Ed25519PrivateKey.generate()
@@ -116,3 +124,59 @@ def test_honest_witnesses_refuse_conflicting_successors(tmp_path) -> None:
             installed_model_hash=model.artifact_hash,
             installed_model_version=0,
         )
+
+
+def test_handover_count_is_lineage_scoped(tmp_path) -> None:
+    policy, _, authority, _, _, successor, registry = _fixture(
+        tmp_path,
+        security_profile=SecurityProfile(max_handover_count=1),
+    )
+    registry.provision_lineage_risk_budget(0.5)
+    registry.handover(
+        state_context=successor,
+        evaluation_policy=policy,
+        authorizer=authority,
+    )
+    second = replace(successor, domain_id="domain-2", state_version=2)
+    with pytest.raises(ValueError, match="lifetime cap"):
+        registry.handover(
+            state_context=second,
+            evaluation_policy=policy,
+            authorizer=authority,
+        )
+
+
+def test_verification_key_cap_is_cumulative_across_handovers(tmp_path) -> None:
+    profile = SecurityProfile(max_verification_keys=6)
+    policy, _, authority, _, _, successor, registry = _fixture(
+        tmp_path,
+        security_profile=profile,
+    )
+    registry.provision_lineage_risk_budget(0.5)
+    next_authority = CertificateAuthority.persistent(tmp_path / "next-witnesses", f=1)
+    next_trust = VerificationTrust.from_keys(
+        next_authority.public_keys,
+        f=1,
+        store_public_key=Ed25519PrivateKey.generate().public_key(),
+        frame_public_key=Ed25519PrivateKey.generate().public_key(),
+    )
+    successor = replace(
+        successor,
+        authority_certificate_hash=next_trust.authority_certificate_hash,
+    )
+    with pytest.raises(ValueError, match="lineage key cap"):
+        registry.handover(
+            state_context=successor,
+            evaluation_policy=policy,
+            verification_trust=next_trust,
+            authorizer=authority,
+        )
+
+
+def test_lineage_budget_rejects_existing_roots_above_key_cap(tmp_path) -> None:
+    _, _, _, _, _, _, registry = _fixture(
+        tmp_path,
+        security_profile=SecurityProfile(max_verification_keys=5),
+    )
+    with pytest.raises(ValueError, match="existing verification roots"):
+        registry.provision_lineage_risk_budget(0.5)

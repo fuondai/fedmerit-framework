@@ -66,8 +66,10 @@ def _binary64(name: str, value: float) -> float:
 class SecurityProfile:
     """Finite caps used by the computational reduction.
 
-    ``max_hash_queries`` is charged per attempted certificate; the remaining
-    query caps are lifetime totals unless their name explicitly says otherwise.
+    ``max_hash_queries`` is a per-attempt, per-leaf random-oracle query cap;
+    ``max_signature_queries`` and ``max_beacon_queries`` are per-key and
+    per-successor caps respectively.  The registry treats handovers and
+    authorized verification keys as lineage-scoped resources.
     """
 
     security_parameter_bits: int = 256
@@ -78,10 +80,13 @@ class SecurityProfile:
     max_collision_queries: int = 1 << 32
     max_signature_queries: int = 1 << 32
     max_beacon_queries: int = 1 << 32
+    max_handover_count: int = 1_000
 
     def __post_init__(self) -> None:
         if self.security_parameter_bits != 256:
-            raise ValueError("reference commitments require 256-bit security parameters")
+            raise ValueError(
+                "reference commitments require 256-bit security parameters"
+            )
         for name in (
             "max_attempts",
             "max_catalog_leaves",
@@ -90,6 +95,7 @@ class SecurityProfile:
             "max_collision_queries",
             "max_signature_queries",
             "max_beacon_queries",
+            "max_handover_count",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -225,9 +231,7 @@ class LinearModelArtifact:
             feature_scale = (1.0,) * width
             object.__setattr__(self, "feature_mean", feature_mean)
             object.__setattr__(self, "feature_scale", feature_scale)
-        if feature_mean and (
-            len(feature_mean) != width or len(feature_scale) != width
-        ):
+        if feature_mean and (len(feature_mean) != width or len(feature_scale) != width):
             raise ValueError("preprocessing vectors must match the model feature width")
         if any(value <= 0 for value in feature_scale):
             raise ValueError("feature scales must be positive")
@@ -262,11 +266,11 @@ class ProbeGroup:
     def __post_init__(self) -> None:
         _required("group_id", self.group_id)
         _sha256("source_manifest_hash", self.source_manifest_hash)
-        features = tuple(
-            tuple(float(value) for value in row) for row in self.features
-        )
+        features = tuple(tuple(float(value) for value in row) for row in self.features)
         labels = tuple(self.labels)
-        if any(isinstance(label, bool) or not isinstance(label, int) for label in labels):
+        if any(
+            isinstance(label, bool) or not isinstance(label, int) for label in labels
+        ):
             raise ValueError("reference evaluator accepts integer binary labels only")
         object.__setattr__(self, "features", features)
         object.__setattr__(self, "labels", labels)
@@ -313,10 +317,7 @@ def contributor_merkle_root(leaves: tuple[ContributorLeaf, ...]) -> str:
     if ordered != leaves or len({leaf.client_id for leaf in leaves}) != len(leaves):
         raise ValueError("contributor leaves must have distinct ascending client IDs")
     return merkle_root(
-        [
-            {"domain": "fedmerit-contributor-leaf-v1", "leaf": leaf}
-            for leaf in leaves
-        ]
+        [{"domain": "fedmerit-contributor-leaf-v1", "leaf": leaf} for leaf in leaves]
     )
 
 
@@ -415,7 +416,9 @@ class SourcePartition:
         object.__setattr__(self, "score_source_manifest_hashes", score)
         for name, manifests in (("proposal", proposal), ("score", score)):
             if not manifests:
-                raise ValueError(f"source partition must contain {name}-source manifests")
+                raise ValueError(
+                    f"source partition must contain {name}-source manifests"
+                )
             if manifests != tuple(sorted(manifests)):
                 raise ValueError(
                     f"{name} source manifests must use canonical ascending order"
@@ -433,7 +436,9 @@ class SourcePartition:
 
     @property
     def all_source_manifest_hashes(self) -> tuple[str, ...]:
-        return tuple(sorted(self.source_manifest_hashes + self.score_source_manifest_hashes))
+        return tuple(
+            sorted(self.source_manifest_hashes + self.score_source_manifest_hashes)
+        )
 
 
 @dataclass(frozen=True)
@@ -653,7 +658,9 @@ class SignedSamplingFrame:
 
     @property
     def public_commitment(self) -> SignedSamplingFrameCommitment:
-        return SignedSamplingFrameCommitment(self.frame.public_commitment, self.signature)
+        return SignedSamplingFrameCommitment(
+            self.frame.public_commitment, self.signature
+        )
 
 
 @dataclass(frozen=True)
@@ -819,8 +826,13 @@ class Candidate:
             raise ValueError(
                 "candidate eligible probe IDs must be distinct and ascending"
             )
-        if len(eligible_ids) > self.evaluation_policy.security_profile.max_catalog_leaves:
-            raise ValueError("candidate eligible set exceeds the registered security cap")
+        if (
+            len(eligible_ids)
+            > self.evaluation_policy.security_profile.max_catalog_leaves
+        ):
+            raise ValueError(
+                "candidate eligible set exceeds the registered security cap"
+            )
         for probe_id_hash in eligible_ids:
             _sha256("eligible_probe_id_hash", probe_id_hash)
         if self.state_context.context_hash != self.context_hash:

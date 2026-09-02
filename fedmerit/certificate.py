@@ -38,6 +38,7 @@ from .model import (
     Receipt,
     ReceiptCore,
     RiskSchedule,
+    SecurityProfile,
     SignedBeaconRound,
     SignedSamplingFrame,
     StateContext,
@@ -85,10 +86,9 @@ class VerificationTrust:
             raise ValueError("witness trust must contain exactly 3f+1 keys")
         if len(self.witness_public_keys) > 64:
             raise ValueError("witness trust exceeds the registered key cap")
-        if (
-            any(len(key) != 32 for key in self.witness_public_keys)
-            or len(set(self.witness_public_keys)) != len(self.witness_public_keys)
-        ):
+        if any(len(key) != 32 for key in self.witness_public_keys) or len(
+            set(self.witness_public_keys)
+        ) != len(self.witness_public_keys):
             raise ValueError("witness trust keys must be distinct Ed25519 public keys")
         if len(self.store_public_key) != 32 or len(self.frame_public_key) != 32:
             raise ValueError("store and frame trust roots must be Ed25519 public keys")
@@ -176,9 +176,7 @@ class HandoverAuthorization:
             raise ValueError("handover witness_count must be positive")
         signatures = tuple(self.signatures)
         object.__setattr__(self, "signatures", signatures)
-        if (
-            any(not isinstance(item, WitnessSignature) for item in signatures)
-        ):
+        if any(not isinstance(item, WitnessSignature) for item in signatures):
             raise ValueError("handover signatures must contain witness signatures")
         indices = tuple(item.witness_index for item in signatures)
         if (
@@ -186,7 +184,9 @@ class HandoverAuthorization:
             or len(indices) != len(set(indices))
             or any(index >= self.witness_count for index in indices)
         ):
-            raise ValueError("handover signatures need distinct ascending roster indices")
+            raise ValueError(
+                "handover signatures need distinct ascending roster indices"
+            )
 
     @property
     def signing_bytes(self) -> bytes:
@@ -246,7 +246,9 @@ def _verification_trust_from_blob(payload: bytes) -> VerificationTrust:
             roster_epoch=int(value["roster_epoch"]),
         )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise ValueError("stored verification trust has invalid canonical bytes") from exc
+        raise ValueError(
+            "stored verification trust has invalid canonical bytes"
+        ) from exc
 
 
 def _replay_core(
@@ -365,7 +367,9 @@ class Witness:
                         serialization.NoEncryption(),
                     )
                     if supplied != stored:
-                        raise ValueError("witness state is bound to another private key")
+                        raise ValueError(
+                            "witness state is bound to another private key"
+                        )
                 private_key = Ed25519PrivateKey.from_private_bytes(stored)
         return cls(witness_index, private_key, str(path))
 
@@ -409,7 +413,9 @@ class Witness:
                 raise ValueError("handover authorization domain is invalid")
             previous_context_hash = str(fields["previous_context_hash"])
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ValueError("handover authorization has invalid canonical bytes") from exc
+            raise ValueError(
+                "handover authorization has invalid canonical bytes"
+            ) from exc
         _require_digest(previous_context_hash, "previous_context_hash")
         authorization_hash = hashlib.sha256(signing_bytes).hexdigest()
         with closing(self._connect()) as db:
@@ -460,7 +466,9 @@ class Witness:
 class CertificateAuthority:
     """Reference witness quorum; issuance derives all gate fields from fixation/release."""
 
-    def __init__(self, witnesses: list[Witness], f: int, *, roster_epoch: int = 0) -> None:
+    def __init__(
+        self, witnesses: list[Witness], f: int, *, roster_epoch: int = 0
+    ) -> None:
         if isinstance(f, bool) or not isinstance(f, int) or f < 0:
             raise ValueError("f must be a non-negative integer")
         if len(witnesses) != 3 * f + 1:
@@ -964,7 +972,9 @@ class AuditRegistry:
                     id INTEGER PRIMARY KEY CHECK(id=1),
                     twin_id TEXT UNIQUE NOT NULL,
                     profile_blob BLOB NOT NULL,
-                    max_attempts INTEGER NOT NULL
+                    max_attempts INTEGER NOT NULL,
+                    max_verification_keys INTEGER NOT NULL,
+                    max_handover_count INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS risk_schedule_usage(
                     schedule_hash TEXT PRIMARY KEY,
@@ -1025,6 +1035,27 @@ class AuditRegistry:
                     "WHERE installed_model_version IS NULL",
                     (initial_context.model_version,),
                 )
+            lineage_columns = tuple(
+                row[1] for row in db.execute("PRAGMA table_info(lineage_security_caps)")
+            )
+            if "max_verification_keys" not in lineage_columns:
+                db.execute(
+                    "ALTER TABLE lineage_security_caps ADD COLUMN max_verification_keys INTEGER"
+                )
+                db.execute(
+                    "UPDATE lineage_security_caps SET max_verification_keys=? "
+                    "WHERE max_verification_keys IS NULL",
+                    (self._evaluation_policy.security_profile.max_verification_keys,),
+                )
+            if "max_handover_count" not in lineage_columns:
+                db.execute(
+                    "ALTER TABLE lineage_security_caps ADD COLUMN max_handover_count INTEGER"
+                )
+                db.execute(
+                    "UPDATE lineage_security_caps SET max_handover_count=? "
+                    "WHERE max_handover_count IS NULL",
+                    (self._evaluation_policy.security_profile.max_handover_count,),
+                )
             row = db.execute(
                 "SELECT genesis_model_hash FROM audit_state WHERE id=1"
             ).fetchone()
@@ -1064,7 +1095,9 @@ class AuditRegistry:
                     (*expected_serving, genesis_model_blob),
                 )
             else:
-                serving_blob = None if serving_model[2] is None else bytes(serving_model[2])
+                serving_blob = (
+                    None if serving_model[2] is None else bytes(serving_model[2])
+                )
                 if (
                     (str(serving_model[0]), int(serving_model[1])) != expected_serving
                     or serving_blob is None
@@ -1130,7 +1163,10 @@ class AuditRegistry:
                 "SELECT context_blob FROM registered_contexts WHERE context_hash=?",
                 (initial_context.context_hash,),
             ).fetchone()
-            if registered_context is not None and bytes(registered_context[0]) != context_blob:
+            if (
+                registered_context is not None
+                and bytes(registered_context[0]) != context_blob
+            ):
                 raise ValueError("context hash is bound to different content")
             db.execute(
                 "INSERT OR IGNORE INTO registered_contexts VALUES(?,?)",
@@ -1149,9 +1185,13 @@ class AuditRegistry:
                 try:
                     attempt_count = len(json.loads(bytes(schedule_blob))["allocations"])
                 except (KeyError, TypeError, ValueError) as exc:
-                    raise ValueError("registered risk schedule has invalid canonical bytes") from exc
+                    raise ValueError(
+                        "registered risk schedule has invalid canonical bytes"
+                    ) from exc
                 if attempt_count <= 0:
-                    raise ValueError("registered risk schedule has no finite allocations")
+                    raise ValueError(
+                        "registered risk schedule has no finite allocations"
+                    )
                 db.execute(
                     "INSERT OR IGNORE INTO risk_schedule_usage VALUES(?,?)",
                     (str(schedule_hash), attempt_count),
@@ -1182,7 +1222,9 @@ class AuditRegistry:
         ).fetchone()
         if prior is not None:
             if (str(prior[0]), str(prior[1])) != (context_hash, detail_hash):
-                raise ValueError("protocol event identity is bound to different content")
+                raise ValueError(
+                    "protocol event identity is bound to different content"
+                )
             return str(prior[2])
         predecessor = db.execute(
             "SELECT event_hash FROM protocol_events ORDER BY sequence DESC LIMIT 1"
@@ -1341,7 +1383,9 @@ class AuditRegistry:
                     "beacon successor is already reserved by another fixation"
                 )
             context_hash = str(
-                db.execute("SELECT context_hash FROM context_head WHERE id=1").fetchone()[0]
+                db.execute(
+                    "SELECT context_hash FROM context_head WHERE id=1"
+                ).fetchone()[0]
             )
             self._append_event_locked(
                 db,
@@ -1419,7 +1463,9 @@ class AuditRegistry:
                 ),
             )
             context_hash = str(
-                db.execute("SELECT context_hash FROM context_head WHERE id=1").fetchone()[0]
+                db.execute(
+                    "SELECT context_hash FROM context_head WHERE id=1"
+                ).fetchone()[0]
             )
             self._append_event_locked(
                 db,
@@ -1479,6 +1525,51 @@ class AuditRegistry:
         return str(row[0]), int(row[1]), blob
 
     @staticmethod
+    def _trust_key_set(trust: VerificationTrust) -> set[bytes]:
+        return {
+            *trust.witness_public_keys,
+            trust.store_public_key,
+            trust.frame_public_key,
+        }
+
+    @classmethod
+    def _lineage_key_set_locked(
+        cls,
+        db: sqlite3.Connection,
+        *,
+        additional: VerificationTrust | None = None,
+    ) -> set[bytes]:
+        keys: set[bytes] = set()
+        for (trust_blob,) in db.execute(
+            "SELECT trust_blob FROM verification_trust"
+        ).fetchall():
+            keys.update(
+                cls._trust_key_set(_verification_trust_from_blob(bytes(trust_blob)))
+            )
+        if additional is not None:
+            keys.update(cls._trust_key_set(additional))
+        return keys
+
+    @classmethod
+    def _enforce_existing_lineage_caps_locked(
+        cls,
+        db: sqlite3.Connection,
+        profile: SecurityProfile,
+    ) -> None:
+        if len(cls._lineage_key_set_locked(db)) > profile.max_verification_keys:
+            raise ValueError(
+                "existing verification roots exceed the lineage security profile"
+            )
+        handovers = int(
+            db.execute(
+                "SELECT COUNT(*) FROM protocol_events "
+                "WHERE event_type='context-handover'"
+            ).fetchone()[0]
+        )
+        if handovers > profile.max_handover_count:
+            raise ValueError("existing handovers exceed the lineage security profile")
+
+    @staticmethod
     def _provision_trust_locked(
         db: sqlite3.Connection,
         context_hash: str,
@@ -1527,12 +1618,28 @@ class AuditRegistry:
             ).fetchone()
             if live is None or selected != str(live[0]):
                 db.rollback()
-                raise ValueError("verification roots may only provision the live context")
-            if db.execute(
-                "SELECT 1 FROM registered_contexts WHERE context_hash=?", (selected,)
-            ).fetchone() is None:
+                raise ValueError(
+                    "verification roots may only provision the live context"
+                )
+            if (
+                db.execute(
+                    "SELECT 1 FROM registered_contexts WHERE context_hash=?",
+                    (selected,),
+                ).fetchone()
+                is None
+            ):
                 db.rollback()
                 raise ValueError("verification roots require a registered context")
+            caps = db.execute(
+                "SELECT max_verification_keys FROM lineage_security_caps WHERE id=1"
+            ).fetchone()
+            if caps is not None:
+                current_keys = self._lineage_key_set_locked(db, additional=trust)
+                if len(current_keys) > int(caps[0]):
+                    db.rollback()
+                    raise ValueError(
+                        "verification roots exceed the cross-handover key cap"
+                    )
             self._provision_trust_locked(db, selected, str(live[1]), trust)
             db.commit()
 
@@ -1594,10 +1701,15 @@ class AuditRegistry:
                 db.execute("SELECT twin_id FROM context_head WHERE id=1").fetchone()[0]
             )
             context_hash = str(
-                db.execute("SELECT context_hash FROM context_head WHERE id=1").fetchone()[0]
+                db.execute(
+                    "SELECT context_hash FROM context_head WHERE id=1"
+                ).fetchone()[0]
             )
-            head = str(db.execute("SELECT head FROM audit_state WHERE id=1").fetchone()[0])
+            head = str(
+                db.execute("SELECT head FROM audit_state WHERE id=1").fetchone()[0]
+            )
             profile = self._evaluation_policy.security_profile
+            self._enforce_existing_lineage_caps_locked(db, profile)
             profile_blob = canonical_bytes(profile)
             prior = db.execute(
                 "SELECT twin_id, anchor_receipt_hash, lifetime_delta "
@@ -1609,16 +1721,31 @@ class AuditRegistry:
                     db.rollback()
                     raise ValueError("lineage risk budget is already frozen")
                 caps = db.execute(
-                    "SELECT twin_id, profile_blob, max_attempts "
+                    "SELECT twin_id, profile_blob, max_attempts, "
+                    "max_verification_keys, max_handover_count "
                     "FROM lineage_security_caps WHERE id=1"
                 ).fetchone()
-                expected_caps = (twin_id, profile_blob, profile.max_attempts)
+                expected_caps = (
+                    twin_id,
+                    profile_blob,
+                    profile.max_attempts,
+                    profile.max_verification_keys,
+                    profile.max_handover_count,
+                )
                 if caps is None:
                     db.execute(
-                        "INSERT INTO lineage_security_caps VALUES(1,?,?,?)",
+                        "INSERT INTO lineage_security_caps "
+                        "(id,twin_id,profile_blob,max_attempts,max_verification_keys,max_handover_count) "
+                        "VALUES(1,?,?,?,?,?)",
                         expected_caps,
                     )
-                elif (str(caps[0]), bytes(caps[1]), int(caps[2])) != expected_caps:
+                elif (
+                    str(caps[0]),
+                    bytes(caps[1]),
+                    int(caps[2]),
+                    int(caps[3]),
+                    int(caps[4]),
+                ) != expected_caps:
                     db.rollback()
                     raise ValueError("lineage security profile is already frozen")
                 self._append_event_locked(
@@ -1630,15 +1757,24 @@ class AuditRegistry:
                 )
                 db.commit()
                 return
-            if db.execute("SELECT 1 FROM risk_schedules LIMIT 1").fetchone() is not None:
+            if (
+                db.execute("SELECT 1 FROM risk_schedules LIMIT 1").fetchone()
+                is not None
+            ):
                 db.rollback()
                 raise ValueError("lineage risk budget must precede every schedule")
+            db.execute("INSERT INTO lineage_risk_budget VALUES(1,?,?,?)", expected)
             db.execute(
-                "INSERT INTO lineage_risk_budget VALUES(1,?,?,?)", expected
-            )
-            db.execute(
-                "INSERT INTO lineage_security_caps VALUES(1,?,?,?)",
-                (twin_id, profile_blob, profile.max_attempts),
+                "INSERT INTO lineage_security_caps "
+                "(id,twin_id,profile_blob,max_attempts,max_verification_keys,max_handover_count) "
+                "VALUES(1,?,?,?,?,?)",
+                (
+                    twin_id,
+                    profile_blob,
+                    profile.max_attempts,
+                    profile.max_verification_keys,
+                    profile.max_handover_count,
+                ),
             )
             self._append_event_locked(
                 db,
@@ -1675,9 +1811,10 @@ class AuditRegistry:
             schedule.lifetime_delta,
             canonical_bytes(schedule),
         )
-        if row is None or (
-            str(row[0]), str(row[1]), float(row[2]), bytes(row[3])
-        ) != expected:
+        if (
+            row is None
+            or (str(row[0]), str(row[1]), float(row[2]), bytes(row[3])) != expected
+        ):
             raise ValueError("risk schedule is not canonically registered")
 
     def register_risk_schedule(self, schedule: RiskSchedule) -> None:
@@ -1742,9 +1879,7 @@ class AuditRegistry:
                     "lineage risk budget must be provisioned before every schedule"
                 )
             live_twin = str(
-                db.execute(
-                    "SELECT twin_id FROM context_head WHERE id=1"
-                ).fetchone()[0]
+                db.execute("SELECT twin_id FROM context_head WHERE id=1").fetchone()[0]
             )
             if str(lineage[0]) != live_twin:
                 db.rollback()
@@ -1829,7 +1964,9 @@ class AuditRegistry:
             (schedule.schedule_hash, allocation_index),
         ).fetchone()
         if row != (schedule.context_hash, fixation_hash):
-            raise ValueError("risk allocation is not canonically spent for this fixation")
+            raise ValueError(
+                "risk allocation is not canonically spent for this fixation"
+            )
 
     def reserve_risk_allocation(
         self,
@@ -1980,7 +2117,8 @@ class AuditRegistry:
                     "handover authorization cannot be checked without prior trust roots"
                 )
             lineage_caps = db.execute(
-                "SELECT twin_id, profile_blob FROM lineage_security_caps WHERE id=1"
+                "SELECT twin_id, profile_blob, max_verification_keys, max_handover_count "
+                "FROM lineage_security_caps WHERE id=1"
             ).fetchone()
             if lineage_caps is not None and (
                 str(lineage_caps[0]) != state_context.twin_id
@@ -1988,9 +2126,28 @@ class AuditRegistry:
                 != canonical_bytes(evaluation_policy.security_profile)
             ):
                 db.rollback()
-                raise ValueError(
-                    "handover must preserve the lineage security profile"
+                raise ValueError("handover must preserve the lineage security profile")
+            if lineage_caps is not None:
+                handovers = int(
+                    db.execute(
+                        "SELECT COUNT(*) FROM protocol_events "
+                        "WHERE event_type='context-handover'"
+                    ).fetchone()[0]
                 )
+                if handovers >= int(lineage_caps[3]):
+                    db.rollback()
+                    raise ValueError(
+                        "context handovers exceed the cross-handover lifetime cap"
+                    )
+                if verification_trust is not None:
+                    current_keys = self._lineage_key_set_locked(
+                        db, additional=verification_trust
+                    )
+                    if len(current_keys) > int(lineage_caps[2]):
+                        db.rollback()
+                        raise ValueError(
+                            "handover verification roots exceed the lineage key cap"
+                        )
             registered = db.execute(
                 "SELECT policy_blob FROM evaluation_policies WHERE policy_hash=?",
                 (evaluation_policy.policy_hash,),
@@ -2007,7 +2164,10 @@ class AuditRegistry:
                 "SELECT context_blob FROM registered_contexts WHERE context_hash=?",
                 (state_context.context_hash,),
             ).fetchone()
-            if existing_context is not None and bytes(existing_context[0]) != context_blob:
+            if (
+                existing_context is not None
+                and bytes(existing_context[0]) != context_blob
+            ):
                 db.rollback()
                 raise ValueError("context hash is bound to different content")
             db.execute(
@@ -2020,7 +2180,10 @@ class AuditRegistry:
                     (live_context_hash,),
                 ).fetchone()
                 if inherited is not None:
-                    if _digest_bytes(bytes(inherited[0])) != state_context.authority_certificate_hash:
+                    if (
+                        _digest_bytes(bytes(inherited[0]))
+                        != state_context.authority_certificate_hash
+                    ):
                         db.rollback()
                         raise ValueError(
                             "successor authority certificate does not bind inherited roots"
@@ -2139,7 +2302,9 @@ class AuditRegistry:
                 if historical is not None:
                     if historical == expected_historical:
                         return
-                    raise ValueError("receipt hash is bound to another historical append")
+                    raise ValueError(
+                        "receipt hash is bound to another historical append"
+                    )
             candidate_authority = candidate.state_context.authority_certificate_hash
             if (
                 live_context != candidate.context_hash
@@ -2182,7 +2347,9 @@ class AuditRegistry:
             or schedule.context_hash != candidate.context_hash
             or schedule.allocation(candidate.risk_schedule_index) != candidate.risk
         ):
-            raise ValueError("issued receipt is not bound to the candidate and schedule")
+            raise ValueError(
+                "issued receipt is not bound to the candidate and schedule"
+            )
         expected = (
             candidate.context_hash,
             candidate.before_model_hash,
@@ -2267,7 +2434,9 @@ class AuditRegistry:
                 )
             except sqlite3.IntegrityError as exc:
                 db.rollback()
-                raise ValueError("conflicting issued attempt or risk allocation") from exc
+                raise ValueError(
+                    "conflicting issued attempt or risk allocation"
+                ) from exc
             self._append_event_locked(
                 db,
                 event_type="receipt-issued",
@@ -2529,14 +2698,15 @@ class AuditRegistry:
                     and bytes(registered_successor[0]) != successor_blob
                 ):
                     db.rollback()
-                    raise ValueError("successor context hash is bound to different content")
+                    raise ValueError(
+                        "successor context hash is bound to different content"
+                    )
                 successor_trust = db.execute(
                     "SELECT trust_blob FROM verification_trust WHERE context_hash=?",
                     (successor_context.context_hash,),
                 ).fetchone()
-                if (
-                    successor_trust is not None
-                    and bytes(successor_trust[0]) != bytes(inherited_trust[0])
+                if successor_trust is not None and bytes(successor_trust[0]) != bytes(
+                    inherited_trust[0]
                 ):
                     db.rollback()
                     raise ValueError(
@@ -2592,7 +2762,9 @@ class AuditRegistry:
             ).rowcount
             if updated_serving != 1:
                 db.rollback()
-                raise ValueError("serving-model compare-and-swap lost a concurrent race")
+                raise ValueError(
+                    "serving-model compare-and-swap lost a concurrent race"
+                )
             if successor_context is not None:
                 db.execute(
                     "INSERT OR IGNORE INTO registered_contexts VALUES(?,?)",
