@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Render the retained UR3 benchmark figure from primitive raw-run fields.
+"""Render the retained UR3 candidate-transition benchmark.
 
-The figure is deliberately compact: safety, acceptance, and protocol latency
-are the three quantities needed to interpret the RIVF results. Every interval
-is recomputed from seed-level rows, so a stale summary cannot change a plotted
-conclusion.
+Panel (a) exposes the primary safety comparison directly: harmful candidates,
+reused-score installations, and fresh-probe installations. Panels (b) and (c)
+then show the availability and local-cost consequences. Every quantity is
+recomputed from primitive seed rows, so a stale summary cannot alter the plot.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy.stats import t as student_t
 
 try:
     import scienceplots  # noqa: F401  # registers the SciencePlots styles
@@ -70,31 +69,23 @@ MARKER_SIZE = 3.0
 ERROR_CAPSIZE = 1.5
 WIDTH_MM = 180.0
 HEIGHT_MM = 53.0
-REPLACEMENT_HARM_THRESHOLD = 0.05
 
 
-def _mean_ci(values: pd.Series, *, binary: bool = False) -> tuple[float, float, float]:
+def _wilson_interval(values: pd.Series) -> tuple[float, float, float]:
     array = values.to_numpy(dtype=float)
     if len(array) == 0:
         return float("nan"), float("nan"), float("nan")
     mean = float(np.mean(array))
-    if binary:
-        size = len(array)
-        z = 1.96
-        denominator = 1.0 + z * z / size
-        center = (mean + z * z / (2.0 * size)) / denominator
-        radius = (
-            z
-            * np.sqrt(mean * (1.0 - mean) / size + z * z / (4.0 * size * size))
-            / denominator
-        )
-        return mean, max(0.0, center - radius), min(1.0, center + radius)
-    if len(array) < 2:
-        return mean, mean, mean
-    half_width = float(student_t.ppf(0.975, len(array) - 1)) * float(
-        np.std(array, ddof=1)
-    ) / np.sqrt(len(array))
-    return mean, mean - half_width, mean + half_width
+    size = len(array)
+    z = 1.96
+    denominator = 1.0 + z * z / size
+    center = (mean + z * z / (2.0 * size)) / denominator
+    radius = (
+        z
+        * np.sqrt(mean * (1.0 - mean) / size + z * z / (4.0 * size * size))
+        / denominator
+    )
+    return mean, max(0.0, center - radius), min(1.0, center + radius)
 
 
 def _configure(axis: plt.Axes) -> None:
@@ -131,12 +122,6 @@ def main() -> None:
     parser.add_argument("--raw", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("fig_ur3_benchmark.pdf"))
     parser.add_argument("--split", choices=("random", "blocked"), default="random")
-    parser.add_argument(
-        "--harm-threshold",
-        type=float,
-        default=REPLACEMENT_HARM_THRESHOLD,
-        help="Operational audit-delta threshold",
-    )
     args = parser.parse_args()
     frame = pd.read_csv(args.raw)
     required = {
@@ -145,7 +130,12 @@ def main() -> None:
         "attack",
         "seed",
         "accepted",
-        "audit_delta",
+        "population_harm",
+        "population_escape",
+        "score_gate_population_escape",
+        "operational_harm",
+        "harmful_escape",
+        "score_gate_escape",
         "installed_balanced_accuracy",
         "protocol_e2e_ms",
     }
@@ -157,29 +147,26 @@ def main() -> None:
         & frame["method"].isin(METHODS)
         & frame["attack"].isin(ATTACKS)
     ].copy()
-    frame["raw_harm"] = (frame["audit_delta"] >= args.harm_threshold).astype(float)
-    frame["harmful_escape_derived"] = (
-        frame["accepted"].astype(bool) & frame["raw_harm"].astype(bool)
-    ).astype(float)
     if frame.empty:
         raise ValueError(f"raw run file has no {args.split!r} benchmark rows")
 
     with plt.style.context(STYLE):
         plt.rcParams.update(
             {
-                "font.family": "serif",
-                "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
+                "font.family": "sans-serif",
+                "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
                 "text.usetex": False,
                 "mathtext.fontset": "stix",
-                "font.size": TEXT_SIZE_PT,
+                "font.size": 7.2,
                 "font.weight": "normal",
-                "axes.labelsize": TEXT_SIZE_PT,
+                "axes.labelsize": 7.2,
                 "axes.labelweight": "normal",
-                "xtick.labelsize": TEXT_SIZE_PT,
-                "ytick.labelsize": TEXT_SIZE_PT,
-                "legend.fontsize": TEXT_SIZE_PT,
+                "xtick.labelsize": 7.2,
+                "ytick.labelsize": 7.2,
+                "legend.fontsize": 7.2,
                 "pdf.fonttype": 42,
                 "ps.fonttype": 42,
+                "svg.fonttype": "none",
                 "savefig.bbox": None,
             }
         )
@@ -188,52 +175,76 @@ def main() -> None:
             3,
             figsize=(WIDTH_MM / 25.4, HEIGHT_MM / 25.4),
             constrained_layout=False,
+            gridspec_kw={"width_ratios": (1.18, 1.48, 1.08)},
         )
         figure.subplots_adjust(
-            left=0.045, right=0.995, bottom=0.24, top=0.90, wspace=0.38
+            left=0.050, right=0.995, bottom=0.24, top=0.88, wspace=0.40
         )
-        x = np.arange(len(METHODS))
+        method_x = np.arange(len(METHODS))
 
-        # (a) Safety: the candidate rate is paired with the installed escape rate.
+        # (a) Primary safety evidence. Catalog harm is the registered epsilon
+        # event; audit harm at tau is diagnostic. The two gates are displayed
+        # separately because only the fresh-probe gate has the theorem.
         axis = axes[0]
-        replacement = frame[frame["attack"] == "model_replacement"]
-        width = 0.33
-        for offset, metric, label, color in (
-            (-width / 2, "raw_harm", "Ungated", "#8C8C8C"),
-            (width / 2, "harmful_escape_derived", "After gate", WONG_PALETTE[1]),
-        ):
-            means, lowers, uppers = [], [], []
-            for method in METHODS:
-                mean, lower, upper = _mean_ci(
-                    replacement.loc[replacement["method"] == method, metric], binary=True
-                )
-                means.append(mean)
-                lowers.append(lower)
-                uppers.append(upper)
-            axis.bar(
-                x + offset,
-                means,
+        evidence_sets = (
+            (
+                "Catalog\n$\\epsilon=0.35$",
+                "population_harm",
+                "score_gate_population_escape",
+                "population_escape",
+            ),
+            (
+                "Audit\n$\\tau=0.05$",
+                "operational_harm",
+                "score_gate_escape",
+                "harmful_escape",
+            ),
+        )
+        safety_x = np.arange(len(evidence_sets))
+        width = 0.23
+        safety_series = (
+            (-width, 1, "Harmful candidate", "#8C8C8C", ""),
+            (0.0, 2, "Reused-score install", WONG_PALETTE[0], "//"),
+            (width, 3, "Fresh-probe install", WONG_PALETTE[1], ".."),
+        )
+        maxima = []
+        for offset, metric_index, label, color, hatch in safety_series:
+            counts = [int(frame[fields[metric_index]].sum()) for fields in evidence_sets]
+            maxima.extend(counts)
+            bars = axis.bar(
+                safety_x + offset,
+                counts,
                 width,
-                yerr=_errorbar_arrays(means, lowers, uppers),
-                capsize=ERROR_CAPSIZE,
                 color=color,
                 edgecolor="#333333",
-                linewidth=0.35,
+                linewidth=0.4,
+                hatch=hatch,
                 label=label,
+                zorder=2,
             )
-        axis.set_ylim(0, 1.12)
-        axis.set_ylabel("Rate")
-        axis.set_xticks(x, [METHOD_LABELS[m] for m in METHODS], rotation=38, ha="right")
+            for bar, count in zip(bars, counts, strict=True):
+                y = count + max(0.8, max(maxima, default=1) * 0.015)
+                axis.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    y,
+                    str(count),
+                    ha="center",
+                    va="bottom",
+                    fontsize=TEXT_SIZE_PT,
+                )
+        axis.set_ylim(0, max(maxima) * 1.20)
+        axis.set_ylabel("Transitions (count)")
+        axis.set_xticks(safety_x, [item[0] for item in evidence_sets])
         axis.legend(
             frameon=False,
-            loc="upper center",
-            bbox_to_anchor=(0.60, 1.08),
-            ncol=2,
-            handlelength=1.0,
-            columnspacing=0.8,
+            loc="upper left",
+            bbox_to_anchor=(-0.02, 1.10),
+            ncol=1,
+            handlelength=1.1,
+            labelspacing=0.15,
             borderpad=0.0,
         )
-        axis.text(-0.14, 1.08, "(a)", transform=axis.transAxes, fontweight="bold")
+        axis.text(-0.16, 1.08, "(a)", transform=axis.transAxes, fontweight="bold")
         _configure(axis)
 
         # (b) Acceptance is shown for every attack; missing score-aware methods
@@ -246,7 +257,7 @@ def main() -> None:
                 values = frame[(frame["method"] == method) & (frame["attack"] == attack)][
                     "accepted"
                 ]
-                mean, lower, upper = _mean_ci(values, binary=True)
+                mean, lower, upper = _wilson_interval(values)
                 means.append(mean)
                 lowers.append(lower)
                 uppers.append(upper)
@@ -254,7 +265,7 @@ def main() -> None:
             if not finite.any():
                 continue
             axis.errorbar(
-                x[finite] + offset,
+                method_x[finite] + offset,
                 np.asarray(means)[finite],
                 yerr=_errorbar_arrays(
                     np.asarray(means)[finite],
@@ -270,7 +281,13 @@ def main() -> None:
             )
         axis.set_ylim(-0.03, 1.08)
         axis.set_ylabel("Acceptance rate")
-        axis.set_xticks(x, [METHOD_LABELS[m] for m in METHODS], rotation=38, ha="right")
+        axis.set_xticks(
+            method_x,
+            [METHOD_LABELS[m] for m in METHODS],
+            rotation=38,
+            ha="right",
+            rotation_mode="anchor",
+        )
         axis.text(-0.14, 1.08, "(b)", transform=axis.transAxes, fontweight="bold")
         _configure(axis)
 
@@ -283,18 +300,42 @@ def main() -> None:
             values = common.loc[common["method"] == method, "protocol_e2e_ms"]
             medians.append(float(values.quantile(0.5)))
             p95s.append(float(values.quantile(0.95)))
-        axis.bar(
-            x,
+        axis.vlines(
+            method_x,
+            medians,
+            p95s,
+            color="#555555",
+            linewidth=0.9,
+            zorder=1,
+        )
+        axis.scatter(
+            method_x,
             medians,
             color=WONG_PALETTE[2],
             edgecolor="#333333",
             linewidth=0.35,
-            label="p50",
+            marker="s",
+            s=(MARKER_SIZE + 0.8) ** 2,
+            label="P50",
+            zorder=3,
         )
-        axis.vlines(x, medians, p95s, color="#222222", linewidth=LINE_WIDTH, label="p95")
-        axis.scatter(x, p95s, color="#222222", s=MARKER_SIZE**2, zorder=3)
+        axis.scatter(
+            method_x,
+            p95s,
+            color="#333333",
+            marker="^",
+            s=(MARKER_SIZE + 0.5) ** 2,
+            label="P95",
+            zorder=3,
+        )
         axis.set_ylabel("Protocol time (ms)")
-        axis.set_xticks(x, [METHOD_LABELS[m] for m in METHODS], rotation=38, ha="right")
+        axis.set_xticks(
+            method_x,
+            [METHOD_LABELS[m] for m in METHODS],
+            rotation=38,
+            ha="right",
+            rotation_mode="anchor",
+        )
         axis.legend(
             frameon=False,
             loc="upper center",
@@ -307,7 +348,7 @@ def main() -> None:
         axis.text(-0.14, 1.08, "(c)", transform=axis.transAxes, fontweight="bold")
         _configure(axis)
 
-        # A shared legend keeps the middle panel free of text collisions.
+        # A shared attack legend keeps the middle panel free of collisions.
         handles, labels = axes[1].get_legend_handles_labels()
         figure.legend(
             handles,
@@ -323,7 +364,9 @@ def main() -> None:
 
         args.output.parent.mkdir(parents=True, exist_ok=True)
         figure.savefig(args.output, transparent=True)
-        figure.savefig(args.output.with_suffix(".png"), dpi=300, transparent=True)
+        figure.savefig(args.output.with_suffix(".svg"), transparent=True)
+        figure.savefig(args.output.with_suffix(".png"), dpi=600, transparent=True)
+        figure.savefig(args.output.with_suffix(".tiff"), dpi=600, transparent=True)
         plt.close(figure)
 
 

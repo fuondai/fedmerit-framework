@@ -162,17 +162,37 @@ only results whose raw CSV and metadata are retained with the release. To run
 the chronological sensitivity, change only `--split blocked` and write to a
 separate output directory; never mix split modes in one CSV.
 
+The retained v4 random and blocked releases use CPython 3.12.13 with the exact
+top-level package versions in `requirements-experiments.txt`. Kaggle exposed
+four logical x86-64 CPUs and a Tesla P100; this NumPy/scikit-learn/SQLite path is
+CPU-bound and does not claim GPU acceleration. Recorded workload times are
+2799.3 s (random) and 2955.1 s (blocked).
+
+Validate a retained release without rerunning the workload:
+
+```bash
+python3 -m scripts.validate_ur3_release \
+  --release results/ur3_v4_random \
+  --split random
+```
+
+The validator checks transition coverage, the registered-versus-injected fault
+contract, decision and escape identities, cycle-level partition disjointness,
+all protocol invariants, environment metadata, and an exact recomputation of
+`summary.csv` from the primitive rows.
+
 Regenerate the paper chart directly from seed-level rows with:
 
 ```bash
 python3 figures/plot_ur3_benchmark.py \
-  --raw results/ur3_v3_random/raw_runs.csv \
+  --raw results/ur3_v4_random/raw_runs.csv \
   --output figures/fig_ur3_benchmark.pdf \
   --split random
 ```
 
-The plotter derives harm flags and Wilson/Student-t intervals from the raw CSV
-and writes both vector PDF and 300 dpi PNG outputs.
+The plotter derives safety counts, seed-level Wilson intervals, and latency
+quantiles from the raw CSV and writes editable PDF/SVG plus 600 dpi PNG/TIFF
+outputs.
 
 The `AuditRegistry` also records each accepted protocol transition in an
 append-only, hash-linked `protocol_events` journal. Update and delete triggers

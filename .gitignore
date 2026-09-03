@@ -21,5 +21,12 @@ results*/
 !results/ur3_v3_blocked/
 !results/ur3_v3_blocked/*.csv
 !results/ur3_v3_blocked/*.json
+!results/ur3_v4_random/
+!results/ur3_v4_random/*.csv
+!results/ur3_v4_random/*.json
+!results/ur3_v4_blocked/
+!results/ur3_v4_blocked/*.csv
+!results/ur3_v4_blocked/*.json
 .DS_Store
 figures/*_preview.png
+figures/*.tiff
