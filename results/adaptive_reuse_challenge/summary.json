@@ -1,9 +1,9 @@
 {
-  "catalog_delta_max": 0.2808641975308642,
-  "catalog_delta_min": 0.22108512020792723,
+  "catalog_delta_max": 0.27631578947368424,
+  "catalog_delta_min": 0.21978557504873295,
   "design": "score-memorization with deterministic unseen predictions",
-  "fresh_delta_max": 0.30748373101952275,
-  "fresh_delta_min": 0.18600867678958785,
+  "fresh_delta_max": 0.31182212581344904,
+  "fresh_delta_min": 0.16648590021691975,
   "fresh_probe_escapes": 0,
   "harmful_candidates": 100,
   "reused_score_escapes": 100,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from scripts.run_adaptive_reuse_challenge import (
+    _trial_interfaces,
     required_groups,
     run_challenge,
     run_trial,
@@ -23,6 +24,17 @@ def test_candidate_is_accepted_on_reused_rows_and_rejected_on_fresh_rows() -> No
     assert row["fresh_delta"] > 0.0
     assert row["reused_score_escape"] == 1
     assert row["fresh_probe_escape"] == 0
+
+
+def test_candidate_view_excludes_source_partition_and_probe_capabilities() -> None:
+    labels, candidate, source = _trial_interfaces(
+        0, population_size=2_000, probe_size=461
+    )
+    assert candidate.candidate_key != 0
+    assert set(vars(candidate)) == {"candidate_key", "memorized"}
+    assert not hasattr(candidate, "catalog_ids")
+    assert not hasattr(candidate, "probe_rng")
+    assert candidate.predict(source.score_ids).tolist() == labels[source.score_ids].tolist()
 
 
 def test_reference_challenge_has_complete_separation() -> None:

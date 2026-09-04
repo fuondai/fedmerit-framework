@@ -2,9 +2,10 @@
 """Controlled separation between reused-score and fresh-probe decisions.
 
 The candidate memorizes the score partition and uses a deterministic prediction
-on every unseen identifier. The source seals the disjoint catalog before the
-candidate is fixed, and a source-only RNG samples the fresh probe after
-fixation. The construction isolates adaptive reuse; it is not an FL workload.
+on every unseen identifier. A trusted harness keeps the source partition and
+probe RNG capabilities separate from the candidate view: the candidate receives
+only score rows and its own prediction key. The construction isolates adaptive
+reuse; it is not an FL workload.
 """
 
 from __future__ import annotations
@@ -35,28 +36,125 @@ def required_groups(alpha: float, epsilon: float, gamma: float) -> int:
     return math.ceil(2.0 * math.log(1.0 / alpha) / (epsilon + gamma) ** 2)
 
 
-def _unseen_prediction(candidate_seed: int, identifier: int) -> float:
-    encoded = f"fedmerit-reuse-challenge:{candidate_seed}:{identifier}".encode()
+def _unseen_prediction(candidate_key: int, identifier: int) -> float:
+    encoded = f"fedmerit-reuse-challenge:{candidate_key}:{identifier}".encode()
     return float(hashlib.sha256(encoded).digest()[0] & 1)
 
 
 @dataclass(frozen=True)
 class MemorizingCandidate:
-    candidate_seed: int
+    candidate_key: int
     memorized: dict[int, int]
+
+    @classmethod
+    def from_score_view(cls, view: "CandidateScoreView") -> "MemorizingCandidate":
+        return cls(
+            candidate_key=view.candidate_key,
+            memorized={
+                int(identifier): int(label)
+                for identifier, label in zip(
+                    view.score_ids, view.score_labels, strict=True
+                )
+            },
+        )
 
     def predict(self, identifiers: np.ndarray) -> np.ndarray:
         return np.fromiter(
             (
                 self.memorized.get(
                     int(identifier),
-                    int(_unseen_prediction(self.candidate_seed, int(identifier))),
+                    int(_unseen_prediction(self.candidate_key, int(identifier))),
                 )
                 for identifier in identifiers
             ),
             dtype=float,
             count=len(identifiers),
         )
+
+
+@dataclass(frozen=True)
+class CandidateScoreView:
+    """The complete interface available to the candidate before fixation."""
+
+    candidate_key: int
+    score_ids: np.ndarray
+    score_labels: np.ndarray
+
+
+@dataclass
+class SourceOnlySampler:
+    """Trusted source capability; this object is never passed to a candidate."""
+
+    score_ids: np.ndarray
+    _catalog_ids: np.ndarray
+    _probe_rng: np.random.Generator
+
+    @classmethod
+    def from_streams(
+        cls,
+        *,
+        population_size: int,
+        probe_size: int,
+        source_stream: np.random.SeedSequence,
+        probe_stream: np.random.SeedSequence,
+    ) -> "SourceOnlySampler":
+        source_order = np.random.default_rng(source_stream).permutation(population_size)
+        return cls(
+            score_ids=source_order[:probe_size],
+            _catalog_ids=source_order[probe_size:],
+            _probe_rng=np.random.default_rng(probe_stream),
+        )
+
+    def candidate_view(
+        self, labels: np.ndarray, candidate_key: int
+    ) -> CandidateScoreView:
+        return CandidateScoreView(
+            candidate_key=candidate_key,
+            score_ids=self.score_ids.copy(),
+            score_labels=labels[self.score_ids].copy(),
+        )
+
+    def fresh_probe(self, probe_size: int) -> np.ndarray:
+        return self._probe_rng.choice(
+            self._catalog_ids, size=probe_size, replace=False
+        )
+
+    def catalog_for_evaluation(self) -> np.ndarray:
+        """Return the sealed catalog to the trusted evaluator, never the candidate."""
+
+        return self._catalog_ids.copy()
+
+
+def _trial_interfaces(
+    trial_id: int, *, population_size: int, probe_size: int
+) -> tuple[np.ndarray, MemorizingCandidate, SourceOnlySampler]:
+    """Create source and candidate interfaces from disjoint harness streams.
+
+    ``trial_id`` indexes a retained result row. It is not accepted by the
+    candidate API; only the harness uses it to make the construction reproducible.
+    """
+
+    data_stream, candidate_stream, source_stream, probe_stream = (
+        np.random.SeedSequence(trial_id).spawn(4)
+    )
+    labels = np.random.default_rng(data_stream).integers(
+        0, 2, size=population_size, dtype=np.int8
+    )
+    candidate_key = int(
+        np.random.default_rng(candidate_stream).integers(
+            0, np.iinfo(np.uint64).max, dtype=np.uint64
+        )
+    )
+    source = SourceOnlySampler.from_streams(
+        population_size=population_size,
+        probe_size=probe_size,
+        source_stream=source_stream,
+        probe_stream=probe_stream,
+    )
+    candidate = MemorizingCandidate.from_score_view(
+        source.candidate_view(labels, candidate_key)
+    )
+    return labels, candidate, source
 
 
 def _paired_delta(
@@ -70,7 +168,7 @@ def _paired_delta(
 
 
 def run_trial(
-    seed: int,
+    trial_id: int,
     *,
     population_size: int = POPULATION_SIZE,
     alpha: float = ALPHA,
@@ -81,23 +179,12 @@ def run_trial(
     if population_size < 2 * probe_size:
         raise ValueError("population must hold disjoint score and fresh probes")
 
-    data_seed, source_seed, probe_seed = np.random.SeedSequence(seed).spawn(3)
-    labels = np.random.default_rng(data_seed).integers(
-        0, 2, size=population_size, dtype=np.int8
+    labels, candidate, source = _trial_interfaces(
+        trial_id, population_size=population_size, probe_size=probe_size
     )
-    source_order = np.random.default_rng(source_seed).permutation(population_size)
-    score_ids = source_order[:probe_size]
-    catalog_ids = source_order[probe_size:]
-
-    # Only score identifiers and labels enter the candidate. Catalog membership,
-    # labels, and the later probe draw remain outside the candidate interface.
-    candidate = MemorizingCandidate(
-        candidate_seed=seed,
-        memorized={int(i): int(labels[i]) for i in score_ids},
-    )
-    fresh_ids = np.random.default_rng(probe_seed).choice(
-        catalog_ids, size=probe_size, replace=False
-    )
+    score_ids = source.score_ids
+    catalog_ids = source.catalog_for_evaluation()
+    fresh_ids = source.fresh_probe(probe_size)
 
     score_delta = _paired_delta(candidate, score_ids, labels)
     catalog_delta = _paired_delta(candidate, catalog_ids, labels)
@@ -106,7 +193,7 @@ def run_trial(
     reused_accepted = score_delta <= -gamma
     fresh_accepted = fresh_delta <= -gamma
     return {
-        "seed": seed,
+        "trial_id": trial_id,
         "population_size": population_size,
         "score_size": probe_size,
         "catalog_size": len(catalog_ids),
@@ -138,13 +225,13 @@ def run_challenge(
     return pd.DataFrame(
         [
             run_trial(
-                seed,
+                trial_id,
                 population_size=population_size,
                 alpha=alpha,
                 epsilon=epsilon,
                 gamma=gamma,
             )
-            for seed in range(trials)
+            for trial_id in range(trials)
         ]
     )
 

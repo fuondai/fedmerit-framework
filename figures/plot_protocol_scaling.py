@@ -42,7 +42,7 @@ GRID = "#D9D9D9"
 DATA_FILE = Path(__file__).with_name("protocol_scaling.csv")
 PDF_FILE = Path(__file__).with_name("fig_protocol_scaling.pdf")
 PNG_FILE = Path(__file__).with_name("fig_protocol_scaling_preview.png")
-DEFAULT_EVIDENCE_FILE = PROJECT_ROOT / "results_devready" / "metrics.json"
+DEFAULT_EVIDENCE_FILE = PROJECT_ROOT / "output" / "metrics.json"
 RISK_ALPHA = 0.01
 RISK_GAMMA = 0.05
 

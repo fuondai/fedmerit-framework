@@ -203,19 +203,23 @@ def main() -> None:
                 label=label,
                 zorder=2,
             )
-            for bar, rate, count, denominator in zip(
-                bars, rates, counts, denominators, strict=True
-            ):
-                axis.text(
-                    bar.get_x() + bar.get_width() / 2,
-                    rate + 2.0,
-                    f"{count}/{denominator}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=TEXT_SIZE_PT,
-                    rotation=90,
+            zero_x = [
+                bar.get_x() + bar.get_width() / 2
+                for bar, rate in zip(bars, rates, strict=True)
+                if rate == 0.0
+            ]
+            if zero_x:
+                axis.scatter(
+                    zero_x,
+                    np.zeros(len(zero_x)),
+                    color=color,
+                    edgecolor="#333333",
+                    linewidth=0.4,
+                    marker="o",
+                    s=18,
+                    zorder=3,
                 )
-        axis.set_ylim(0, 130)
+        axis.set_ylim(0, 110)
         axis.set_ylabel("Harmful installs (%)")
         axis.set_xticks(safety_x, [item[0] for item in evidence])
         axis.legend(
@@ -227,7 +231,6 @@ def main() -> None:
             columnspacing=0.65,
             borderpad=0.0,
         )
-        axis.text(0.02, 0.95, "(a)", transform=axis.transAxes, fontweight="bold")
         _configure(axis)
 
         # (b) Blank cells are out-of-contract combinations, not zero values.
@@ -272,7 +275,6 @@ def main() -> None:
         colorbar.set_label("Accepted / 20", fontsize=TEXT_SIZE_PT)
         colorbar.set_ticks([0, 10, 20])
         colorbar.ax.tick_params(labelsize=TEXT_SIZE_PT, width=0.45, length=2.0)
-        axis.text(0.02, 0.93, "(b)", transform=axis.transAxes, fontweight="bold")
         _configure(axis, grid=False)
 
         # (c) Observed local protocol-time quantiles.
@@ -323,7 +325,6 @@ def main() -> None:
             columnspacing=0.8,
             borderpad=0.0,
         )
-        axis.text(0.02, 0.93, "(c)", transform=axis.transAxes, fontweight="bold")
         _configure(axis)
 
         args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -72,6 +72,8 @@ condition. A binary candidate memorizes all score labels, while its prediction
 on an unseen identifier is a deterministic hash bit. The baseline predicts
 `0.5`. Reusing the score set therefore gives paired Brier delta `-0.25`; a fresh
 probe is drawn without replacement from the disjoint sealed catalog after the
-candidate is fixed. The retained records expose the score, catalog, and fresh
-deltas for every trial. This design isolates the reuse mechanism that the UR3
-workload did not separate.
+candidate is fixed. The trusted harness exposes a `CandidateScoreView` containing
+only score identifiers, score labels, and a candidate-specific prediction key.
+It retains the catalog partition and probe RNG capability in `SourceOnlySampler`.
+The retained records use `trial_id` only as a harness row label. This design
+isolates the reuse mechanism that the UR3 workload did not separate.

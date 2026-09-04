@@ -18,6 +18,10 @@ never carries collection-window, source-handle, row, or salt metadata.
 - Runtime dependencies are pinned in `requirements.lock`; development pins
   (pytest and ruff) are in `requirements-dev.txt`.
 
+`requirements-experiments.txt` is a separate archival environment for the
+retained UR3 rows. Its `cryptography==43.0.3` pin matches the recorded Kaggle
+metadata; it is not a replacement for the `cryptography==46.0.7` runtime lock.
+
 Install in an isolated environment:
 
 ```bash
@@ -58,11 +62,12 @@ python3 -m scripts.produce_evidence --output output
 ```
 
 The producer writes 46 exact calculation and conformance records, aggregate
-metrics, a known-answer receipt, and a SHA-256 manifest. It rejects a receipt
-that differs from `artifacts/reference_receipt.json`. Generated conformance
-directories are not part of the source distribution. The checked-in exceptions
-are the two validated UR3 v4 releases and the controlled adaptive-reuse challenge
-used by the manuscript.
+metrics, a known-answer receipt, and a SHA-256 manifest. It checks the generated
+receipt against the sole checked-in known-answer vector,
+`artifacts/reference_receipt.json`. Generated conformance directories are not
+source artifacts and must not be treated as canonical evidence. The checked-in
+exceptions are the two validated UR3 v4 releases and the controlled
+adaptive-reuse challenge used by the manuscript.
 
 ## Paper chart
 
@@ -71,9 +76,9 @@ render the protocol-scaling chart:
 
 ```bash
 python3 -m pip install -r requirements-figures.txt
-python3 -m scripts.produce_evidence --output results_devready
+python3 -m scripts.produce_evidence --output output
 python3 figures/plot_protocol_scaling.py \
-  --evidence results_devready/metrics.json
+  --evidence output/metrics.json
 ```
 
 The renderer checks the three plotted risk rows with the implementation's exact
@@ -196,10 +201,13 @@ python3 -m scripts.run_adaptive_reuse_challenge \
 ```
 
 Each candidate sees and memorizes only its score identifiers and labels. The
-source fixes a disjoint catalog before the candidate and draws the fresh probe
-after fixation with a source-only random stream. The retained 100 deterministic
-trials are a controlled construction that isolates evidence reuse; they are not
-an FL workload or an empirical deployment-rate estimate.
+trusted harness fixes a disjoint catalog before the candidate and draws the
+fresh probe after fixation with a source-only random stream. The candidate API
+receives score rows and a separate prediction key, never source-partition or
+probe-RNG capability; the retained `trial_id` is a harness row label, not
+candidate input. The 100 deterministic trials are a controlled construction
+that isolates evidence reuse; they are not an FL workload or an empirical
+deployment-rate estimate.
 
 Regenerate the paper chart directly from seed-level rows with:
 
