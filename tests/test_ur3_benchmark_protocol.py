@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
 import pytest
 
 from fedmerit import (
@@ -19,7 +18,7 @@ from scripts.run_ur3_benchmark import (
     _foundationfl,
     _fault_configuration,
     _balanced_binary_rows,
-    _mean_ci,
+    _descriptive_range,
     _score_aware_updates,
     _split_groups,
 )
@@ -145,13 +144,13 @@ def test_split_rejects_short_or_duplicate_population() -> None:
         _split_groups(groups[:-1] + groups[:1], seed=0, mode="random")
 
 
-def test_wilson_intervals_are_asymmetric_and_inside_unit_interval() -> None:
-    mean, lower, upper = _mean_ci(pd.Series([0] * 20), binary=True)
-    assert mean == lower == 0
-    assert 0.16 < upper < 0.162
-    mean, lower, upper = _mean_ci(pd.Series([1] * 20), binary=True)
-    assert mean == upper == 1
-    assert 0.838 < lower < 0.84
+def test_summary_range_is_descriptive() -> None:
+    import pandas as pd
+
+    mean, minimum, maximum = _descriptive_range(pd.Series([0, 0, 1, 1]))
+    assert mean == 0.5
+    assert minimum == 0.0
+    assert maximum == 1.0
 
 
 def test_score_attack_uses_fixed_query_budget_and_preserves_honest_updates() -> None:

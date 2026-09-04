@@ -60,8 +60,9 @@ python3 -m scripts.produce_evidence --output output
 The producer writes 46 exact calculation and conformance records, aggregate
 metrics, a known-answer receipt, and a SHA-256 manifest. It rejects a receipt
 that differs from `artifacts/reference_receipt.json`. Generated conformance
-directories are not part of the source distribution; the retained UR3 benchmark
-release under `results/ur3/` is the checked-in exception used by the manuscript.
+directories are not part of the source distribution. The checked-in exceptions
+are the two validated UR3 v4 releases and the controlled adaptive-reuse challenge
+used by the manuscript.
 
 ## Paper chart
 
@@ -126,9 +127,11 @@ handover fails before exceeding its cap.
 `scripts/run_ur3_benchmark.py` is an optional experiment driver for the UCI
 UR3 CobotOps workbook (DOI `10.24432/C5J891`). It treats operation cycles as
 non-IID groups and keeps proposal, score, sealed-catalog, and audit groups
-disjoint. The fixed split uses 110 proposal, 30 score, 76 catalog, and 20
-held-out audit cycles; `--split blocked` repeats the same protocol with
-chronological rather than random partitioning. Every method receives the same
+disjoint. The fixed split uses 110 proposal, 30 score, 80 commit-pool, and 20
+held-out audit cycles. Two complete 38-cycle leaves consume 76 commit-pool
+cycles; four cycles remain outside the released catalog instead of creating an
+undersized leaf. `--split blocked` repeats the same protocol with chronological
+rather than random partitioning. Every method receives the same
 20-round benign FedAvg checkpoint and produces one candidate transition. This
 is a controlled candidate-generator comparison, not seven end-to-end training
 runs. The exact adaptations, attack visibility, and metric semantics are listed
@@ -151,7 +154,7 @@ Run the retained protocol with:
 ```bash
 python3 -m scripts.run_ur3_benchmark \
   --dataset /path/to/UR3_CobotOps.xlsx \
-  --output results/ur3 \
+  --output results/ur3_v4_random_reproduced \
   --split random
 ```
 
@@ -177,22 +180,41 @@ python3 -m scripts.validate_ur3_release \
 ```
 
 The validator checks transition coverage, the registered-versus-injected fault
-contract, decision and escape identities, cycle-level partition disjointness,
-all protocol invariants, environment metadata, and an exact recomputation of
-`summary.csv` from the primitive rows.
+contract, threshold and installed-state identities, selected-leaf membership,
+cycle-level partition disjointness, protocol invariants, environment metadata,
+and an exact recomputation of `summary.csv` from the primitive rows. The summary
+contains descriptive means, minima, maxima, counts, and observed quantiles. It
+does not treat method/attack rows sharing a seed as independent replicates. A
+full loss-level replay still requires the cited UR3 workbook and benchmark
+driver.
+
+Reproduce the controlled adaptive-reuse separation with:
+
+```bash
+python3 -m scripts.run_adaptive_reuse_challenge \
+  --output results/adaptive_reuse_challenge
+```
+
+Each candidate sees and memorizes only its score identifiers and labels. The
+source fixes a disjoint catalog before the candidate and draws the fresh probe
+after fixation with a source-only random stream. The retained 100 deterministic
+trials are a controlled construction that isolates evidence reuse; they are not
+an FL workload or an empirical deployment-rate estimate.
 
 Regenerate the paper chart directly from seed-level rows with:
 
 ```bash
 python3 figures/plot_ur3_benchmark.py \
   --raw results/ur3_v4_random/raw_runs.csv \
+  --challenge results/adaptive_reuse_challenge/records.csv \
   --output figures/fig_ur3_benchmark.pdf \
   --split random
 ```
 
-The plotter derives safety counts, seed-level Wilson intervals, and latency
-quantiles from the raw CSV and writes editable PDF/SVG plus 600 dpi PNG/TIFF
-outputs.
+The plotter derives safety fractions, acceptance counts, and observed latency
+quantiles from primitive rows. It reports no binomial confidence interval for
+the dependent method/attack rows and writes editable PDF/SVG plus 600 dpi
+PNG/TIFF outputs.
 
 The `AuditRegistry` also records each accepted protocol transition in an
 append-only, hash-linked `protocol_events` journal. Update and delete triggers

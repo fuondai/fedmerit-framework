@@ -5,11 +5,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
-from scripts.run_ur3_benchmark import _summarize
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from scripts.run_ur3_benchmark import (
+    CATALOG_LEAVES,
+    COMMIT_GROUPS,
+    COMMIT_POOL_GROUPS,
+    EPSILON,
+    GAMMA,
+    OPERATIONAL_HARM,
+    _summarize,
+)
 
 
 METHOD_ATTACKS = {
@@ -130,6 +144,98 @@ def _validate_decisions(frame: pd.DataFrame) -> None:
         _require(set(frame[column]) == {1}, f"protocol check failed: {column}")
 
 
+def _validate_numeric_semantics(frame: pd.DataFrame) -> None:
+    numeric = (
+        "commit_delta",
+        "audit_delta",
+        "population_delta",
+        "score_delta",
+        "receipt_delta",
+        "before_balanced_accuracy",
+        "candidate_balanced_accuracy",
+        "installed_balanced_accuracy",
+        "paired_accuracy_gain",
+        "paired_audit_risk_reduction",
+    )
+    _require(
+        np.isfinite(frame[list(numeric)].to_numpy(dtype=float)).all(),
+        "release contains a non-finite primitive metric",
+    )
+    accepted = frame["accepted"].astype(bool)
+    score_accepted = frame["score_gate_accepted"].astype(bool)
+    identities = {
+        "accepted threshold": accepted == (frame["commit_delta"] <= -GAMMA),
+        "reused-score threshold": score_accepted
+        == (frame["score_delta"] <= -GAMMA),
+        "catalog harm threshold": frame["population_harm"].astype(bool)
+        == (frame["population_delta"] >= EPSILON),
+        "audit diagnostic threshold": frame["operational_harm"].astype(bool)
+        == (frame["audit_delta"] >= OPERATIONAL_HARM),
+        "audit declared-harm threshold": frame["declared_harm"].astype(bool)
+        == (frame["audit_delta"] >= EPSILON),
+        "beneficial threshold": frame["beneficial"].astype(bool)
+        == (frame["audit_delta"] < 0.0),
+        "false rejection": frame["false_rejection"].astype(bool)
+        == ((~accepted) & (frame["audit_delta"] < 0.0)),
+    }
+    for name, values in identities.items():
+        _require(bool(values.all()), f"primitive identity failed: {name}")
+
+    _require(
+        np.allclose(frame["receipt_delta"], frame["commit_delta"], atol=1e-12),
+        "receipt delta differs from the selected fresh-probe statistic",
+    )
+    expected_installed = np.where(
+        accepted,
+        frame["candidate_balanced_accuracy"],
+        frame["before_balanced_accuracy"],
+    )
+    _require(
+        np.allclose(frame["installed_balanced_accuracy"], expected_installed),
+        "installed balanced accuracy disagrees with the receipt decision",
+    )
+    _require(
+        np.allclose(
+            frame["paired_accuracy_gain"],
+            frame["installed_balanced_accuracy"]
+            - frame["candidate_balanced_accuracy"],
+        ),
+        "paired accuracy recovery is inconsistent",
+    )
+    _require(
+        np.allclose(
+            frame["paired_audit_risk_reduction"],
+            np.where(accepted, 0.0, frame["audit_delta"]),
+        ),
+        "paired audit-risk reduction is inconsistent",
+    )
+
+    _require(set(frame["catalog_leaves"]) == {CATALOG_LEAVES}, "catalog size mismatch")
+    _require(
+        set(frame["catalog_leaves_consumed"]) == {1},
+        "every transition must consume exactly one catalog leaf",
+    )
+    _require(set(frame["witness_faults_injected"]) == {1}, "witness fault mismatch")
+    _require(set(frame["witness_threshold"]) == {3}, "witness threshold mismatch")
+    _require(set(frame["witness_signatures"]) == {3}, "signature count mismatch")
+    _require(
+        frame["receipt_hash"].map(
+            lambda value: bool(re.fullmatch(r"[0-9a-f]{64}", str(value)))
+        ).all(),
+        "receipt hash is not canonical lowercase SHA-256",
+    )
+    for row in frame[["catalog_cycle_ids", "selected_cycle_ids"]].itertuples(
+        index=False
+    ):
+        catalog = _cycle_set(row.catalog_cycle_ids, field="catalog_cycle_ids")
+        selected = {
+            int(item.removeprefix("cycle-"))
+            for item in str(row.selected_cycle_ids).split(";")
+        }
+        _require(len(selected) == COMMIT_GROUPS, "selected leaf has wrong group count")
+        _require(selected <= catalog, "selected leaf is outside the sealed catalog")
+
+
 def _validate_metadata(metadata: dict[str, object], frame: pd.DataFrame, split: str) -> None:
     _require(metadata.get("records") == len(frame), "metadata record count mismatch")
     _require(metadata.get("split") == split, "metadata split mismatch")
@@ -143,6 +249,18 @@ def _validate_metadata(metadata: dict[str, object], frame: pd.DataFrame, split: 
     _require(
         design.get("end_to_end_training_comparison") is False,
         "benchmark must identify itself as a candidate-transition test",
+    )
+    allocation = metadata.get("split_groups_per_seed")
+    _require(isinstance(allocation, dict), "split allocation metadata is missing")
+    _require(allocation.get("commit_pool") == COMMIT_POOL_GROUPS, "pool size mismatch")
+    _require(
+        allocation.get("commit_selected") == COMMIT_GROUPS * CATALOG_LEAVES,
+        "sealed catalog allocation mismatch",
+    )
+    _require(
+        allocation.get("commit_unused")
+        == COMMIT_POOL_GROUPS - COMMIT_GROUPS * CATALOG_LEAVES,
+        "unused pool allocation mismatch",
     )
     environment = metadata.get("environment")
     required_environment = {
@@ -206,6 +324,25 @@ def validate_release(root: Path, *, split: str) -> dict[str, int | str]:
         "declared_harmful_escape",
         "installed_candidate",
         "receipt_decision",
+        "commit_delta",
+        "audit_delta",
+        "population_delta",
+        "score_delta",
+        "receipt_delta",
+        "beneficial",
+        "false_rejection",
+        "before_balanced_accuracy",
+        "candidate_balanced_accuracy",
+        "installed_balanced_accuracy",
+        "paired_accuracy_gain",
+        "paired_audit_risk_reduction",
+        "receipt_hash",
+        "catalog_leaves",
+        "selected_cycle_ids",
+        "catalog_leaves_consumed",
+        "witness_faults_injected",
+        "witness_signatures",
+        "witness_threshold",
         *PROTOCOL_CHECKS,
         *PARTITIONS,
     }
@@ -214,6 +351,7 @@ def validate_release(root: Path, *, split: str) -> dict[str, int | str]:
     _validate_coverage(frame, split)
     _validate_fault_contract(frame)
     _validate_decisions(frame)
+    _validate_numeric_semantics(frame)
     _validate_partitions(frame)
     _validate_metadata(metadata, frame, split)
     _validate_summary(frame, summary)

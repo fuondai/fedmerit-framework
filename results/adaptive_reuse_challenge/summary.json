@@ -1,0 +1,13 @@
+{
+  "catalog_delta_max": 0.2808641975308642,
+  "catalog_delta_min": 0.22108512020792723,
+  "design": "score-memorization with deterministic unseen predictions",
+  "fresh_delta_max": 0.30748373101952275,
+  "fresh_delta_min": 0.18600867678958785,
+  "fresh_probe_escapes": 0,
+  "harmful_candidates": 100,
+  "reused_score_escapes": 100,
+  "score_delta_max": -0.25,
+  "score_delta_min": -0.25,
+  "trials": 100
+}

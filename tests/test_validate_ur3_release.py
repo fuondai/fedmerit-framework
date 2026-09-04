@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_retained_release_validator_recomputes_all_contracts(tmp_path: Path) -> None:
-    source = ROOT / "results" / "ur3_v3_random"
+    source = ROOT / "results" / "ur3_v4_random"
     frame = pd.read_csv(source / "raw_runs.csv")
     frame["configured_fault_bound"] = 6
     frame["actual_byzantine_clients"] = frame["attack"].map(

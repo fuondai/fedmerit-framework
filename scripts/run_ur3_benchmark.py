@@ -36,7 +36,6 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
-from scipy.stats import t as student_t
 
 from fedmerit import (
     AuditRegistry,
@@ -1061,30 +1060,14 @@ def _execute_protocol_trial(
     }
 
 
-def _mean_ci(values: pd.Series, *, binary: bool = False) -> tuple[float, float, float]:
+def _descriptive_range(values: pd.Series) -> tuple[float, float, float]:
+    """Return mean, minimum, and maximum without an independence claim."""
+
     array = values.to_numpy(dtype=float)
+    if len(array) == 0:
+        return math.nan, math.nan, math.nan
     mean = float(np.mean(array))
-    if binary:
-        # Wilson's interval remains informative at 0 and 1, unlike the
-        # normal approximation's zero-width interval at the boundaries.
-        size = len(array)
-        z = 1.96
-        denominator = 1.0 + z * z / size
-        center = (mean + z * z / (2.0 * size)) / denominator
-        radius = (
-            z
-            * math.sqrt(mean * (1.0 - mean) / size + z * z / (4.0 * size * size))
-            / denominator
-        )
-        return mean, max(0.0, center - radius), min(1.0, center + radius)
-    half_width = (
-        0.0
-        if len(array) < 2
-        else float(student_t.ppf(0.975, len(array) - 1))
-        * float(np.std(array, ddof=1))
-        / math.sqrt(len(array))
-    )
-    return mean, mean - half_width, mean + half_width
+    return mean, float(np.min(array)), float(np.max(array))
 
 
 def _run_seed(
@@ -1388,34 +1371,10 @@ def _summarize(frame: pd.DataFrame) -> pd.DataFrame:
             "seeds": int(group["seed"].nunique()),
         }
         for metric in metric_names:
-            mean, lower, upper = _mean_ci(
-                group[metric],
-                binary=metric
-                in {
-                    "accepted",
-                    "operational_harm",
-                    "declared_harm",
-                    "harmful_escape",
-                    "population_harm",
-                    "population_escape",
-                    "score_gate_accepted",
-                    "score_gate_escape",
-                    "score_gate_population_escape",
-                    "declared_harmful_escape",
-                    "false_rejection",
-                    "append_succeeded",
-                    "serving_bytes_verified",
-                    "risk_consumed",
-                    "probe_consumed",
-                    "competing_fixation_blocked",
-                    "eligible_subset_blocked",
-                    "witness_quorum_met",
-                    "event_chain_valid",
-                },
-            )
+            mean, minimum, maximum = _descriptive_range(group[metric])
             row[f"{metric}_mean"] = mean
-            row[f"{metric}_lower95"] = lower
-            row[f"{metric}_upper95"] = upper
+            row[f"{metric}_min"] = minimum
+            row[f"{metric}_max"] = maximum
         for metric in ("certificate_issue_ms", "protocol_e2e_ms"):
             row[f"{metric}_p50"] = float(group[metric].quantile(0.5))
             row[f"{metric}_p95"] = float(group[metric].quantile(0.95))
@@ -1536,6 +1495,8 @@ def main() -> None:
             "score": 30,
             "commit_pool": 80,
             "commit_selected": COMMIT_GROUPS * CATALOG_LEAVES,
+            "commit_unused": COMMIT_POOL_GROUPS
+            - COMMIT_GROUPS * CATALOG_LEAVES,
             "groups_per_released_leaf": COMMIT_GROUPS,
             "held_out_audit": len(groups) - 220,
             "score_source_rows_min": int(frame["score_source_rows"].min()),

@@ -61,14 +61,43 @@ receipt head in one transaction. Reject updates only audit state. Handover keeps
 `TwinID`, increments state version exactly once, and carries the installed model
 version; it cannot reset the risk envelope.
 
-## Reduction boundary
+## Random-oracle transcript
 
-The reduction replaces salted unopened leaves, aborts on commitment collision or
-second opening, aborts on accepted frame/witness/store/handover forgery, and then
-replaces the finalized successor by the ideal beacon value. In the final game,
-the selected probe is independent of the fixed candidate, so the registered
-finite-sample bound applies conditionally to every attempt. One-use spending and
-the immutable lineage envelope compose these conditional bounds. Quorum
-intersection and the live-state compare-and-swap bind the unique replay result to
-the installed bytes.
+The hash oracle receives domain-separated byte strings. Catalog creation samples
+every 256-bit salt uniformly once; no game changes that distribution. Before a
+leaf opens, the adversary sees its opaque identifier, payload commitment, Merkle
+root, signed inventory, and all public fixation state. It does not see the salt,
+opening, private source permutation, or future beacon successor. `Q_c` counts the
+honest construction and verification hash calls included in collision accounting;
+`Q_h` bounds adversarial oracle calls per unopened leaf.
 
+For one attempt, `BadGuess` occurs if an adversarial pre-reveal oracle query is
+the exact domain-separated opening input for an eligible hidden leaf. Conditional
+on the preceding adaptive transcript, that input contains a uniform unexposed
+256-bit salt, hence `Pr[BadGuess] <= M Q_h / 2^256`. Across at most `T` attempts,
+the union bound is `T M Q_h / 2^256`. This is a random-oracle hiding argument,
+not a claim implied by the SHA-256 standard or by preimage resistance alone.
+
+## Game sequence
+
+`G0` is the real installed-transition game. `G1` is identical but aborts on
+`BadGuess`; unopened commitments can then be simulated as independent oracle
+labels until their authorized opening. `G2` aborts if two distinct inputs collide
+or one commitment/Merkle position admits a second opening. With
+`Q_H = Q_c + T M Q_h`, this change is bounded by the registered collision term.
+`G3` aborts when the verifier accepts a source, frame, store, witness, or handover
+signature that was not authorized under its registered key and scope. A union
+bound over at most `K` keys gives the registered Ed25519 EUF-CMA term. `G4`
+replaces each authenticated finalized successor by one independent uniform
+256-bit value after fixation; the difference is exactly the registered beacon
+distinguishing advantage.
+
+In `G4`, the candidate, catalog, and schedule are fixed before a successor selects
+one still-eligible leaf. Conditional on every preceding transcript, the selected
+probe is therefore independent of the candidate and the registered finite-sample
+bound applies to that attempt. One-use spending and the immutable lineage
+envelope sum these conditional risks without assuming independent attempts.
+Outside the forgery game, two `2f+1` quorums intersect in at least one honest
+witness, while the live-state compare-and-swap binds the unique signed core to
+the installed bytes. These two arguments cover conflicting-core installation
+and stale-state installation, respectively.

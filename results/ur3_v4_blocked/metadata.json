@@ -121,6 +121,7 @@
   "split_groups_per_seed": {
     "commit_pool": 80,
     "commit_selected": 76,
+    "commit_unused": 4,
     "groups_per_released_leaf": 38,
     "held_out_audit": 20,
     "proposal": 110,

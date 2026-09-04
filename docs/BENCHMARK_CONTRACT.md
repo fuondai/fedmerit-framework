@@ -59,3 +59,19 @@ bytes reported by the paper are a wire-format lower bound with the same
 exclusions. Chronological blocking is a temporal-shift sensitivity check, not a
 finite-to-deployment bridge.
 
+The source allocates 80 commit-pool cycles per seed. The registered sample rule
+requires 38 groups per leaf, so the catalog contains two complete leaves and
+uses 76 cycles. The remaining four cycles stay outside the catalog and cannot be
+selected. This fixed remainder avoids an undersized leaf with a different risk
+contract.
+
+## Controlled evidence-reuse challenge
+
+The separate adaptive-reuse challenge is a finite construction, not another UR3
+condition. A binary candidate memorizes all score labels, while its prediction
+on an unseen identifier is a deterministic hash bit. The baseline predicts
+`0.5`. Reusing the score set therefore gives paired Brier delta `-0.25`; a fresh
+probe is drawn without replacement from the disjoint sealed catalog after the
+candidate is fixed. The retained records expose the score, catalog, and fresh
+deltas for every trial. This design isolates the reuse mechanism that the UR3
+workload did not separate.
