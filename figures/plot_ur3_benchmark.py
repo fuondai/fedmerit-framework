@@ -169,10 +169,10 @@ def main() -> None:
             3,
             figsize=(WIDTH_MM / 25.4, HEIGHT_MM / 25.4),
             constrained_layout=False,
-            gridspec_kw={"width_ratios": (1.15, 1.52, 1.05)},
+            gridspec_kw={"width_ratios": (1.20, 1.60, 1.20)},
         )
         figure.subplots_adjust(
-            left=0.052, right=0.988, bottom=0.25, top=0.87, wspace=0.43
+            left=0.052, right=0.970, bottom=0.25, top=0.87, wspace=0.20
         )
         method_x = np.arange(len(METHODS))
 
@@ -193,7 +193,7 @@ def main() -> None:
                 100.0 * count / denominator
                 for count, denominator in zip(counts, denominators, strict=True)
             ]
-            bars = axis.bar(
+            axis.bar(
                 safety_x + offset,
                 rates,
                 width,
@@ -203,22 +203,6 @@ def main() -> None:
                 label=label,
                 zorder=2,
             )
-            zero_x = [
-                bar.get_x() + bar.get_width() / 2
-                for bar, rate in zip(bars, rates, strict=True)
-                if rate == 0.0
-            ]
-            if zero_x:
-                axis.scatter(
-                    zero_x,
-                    np.zeros(len(zero_x)),
-                    color=color,
-                    edgecolor="#333333",
-                    linewidth=0.4,
-                    marker="o",
-                    s=18,
-                    zorder=3,
-                )
         axis.set_ylim(0, 110)
         axis.set_ylabel("Harmful installs (%)")
         axis.set_xticks(safety_x, [item[0] for item in evidence])
@@ -230,6 +214,9 @@ def main() -> None:
             handlelength=0.9,
             columnspacing=0.65,
             borderpad=0.0,
+        )
+        axis.text(
+            0.02, 0.95, "(a)", transform=axis.transAxes, fontweight="bold", fontsize=8.0
         )
         _configure(axis)
 
@@ -246,7 +233,7 @@ def main() -> None:
                     acceptance[row_index, column_index] = int(values.sum())
         color_map = plt.colormaps["viridis"].copy()
         color_map.set_bad("#EEEEEE")
-        image = axis.imshow(acceptance, vmin=0, vmax=20, cmap=color_map, aspect="auto")
+        axis.imshow(acceptance, vmin=0, vmax=20, cmap=color_map, aspect="auto")
         for row_index in range(len(ATTACKS)):
             for column_index in range(len(METHODS)):
                 value = acceptance[row_index, column_index]
@@ -271,10 +258,9 @@ def main() -> None:
         axis.set_yticks(
             np.arange(len(ATTACKS)), [ATTACK_LABELS[item] for item in ATTACKS]
         )
-        colorbar = figure.colorbar(image, ax=axis, fraction=0.045, pad=0.025)
-        colorbar.set_label("Accepted / 20", fontsize=TEXT_SIZE_PT)
-        colorbar.set_ticks([0, 10, 20])
-        colorbar.ax.tick_params(labelsize=TEXT_SIZE_PT, width=0.45, length=2.0)
+        axis.text(
+            0.02, 0.93, "(b)", transform=axis.transAxes, fontweight="bold", fontsize=8.0
+        )
         _configure(axis, grid=False)
 
         # (c) Observed local protocol-time quantiles.
@@ -309,6 +295,7 @@ def main() -> None:
             zorder=3,
         )
         axis.set_ylabel("Protocol time (ms)")
+        axis.yaxis.set_label_position("right")
         axis.set_xticks(
             method_x,
             [METHOD_LABELS[method] for method in METHODS],
@@ -324,6 +311,9 @@ def main() -> None:
             handlelength=1.0,
             columnspacing=0.8,
             borderpad=0.0,
+        )
+        axis.text(
+            0.02, 0.93, "(c)", transform=axis.transAxes, fontweight="bold", fontsize=8.0
         )
         _configure(axis)
 

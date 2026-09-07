@@ -142,8 +142,9 @@ is a controlled candidate-generator comparison, not seven end-to-end training
 runs. The exact adaptations, attack visibility, and metric semantics are listed
 in `docs/BENCHMARK_CONTRACT.md`.
 
-Each candidate first receives its unguarded audit score and then runs through an
-isolated end-to-end FedMERIT instance: signed frame, finite risk schedule,
+The harness computes the unguarded audit diagnostic after candidate construction;
+it is not available to the candidate or score-aware attacker. Each candidate then
+runs through an isolated end-to-end FedMERIT instance: signed frame, finite risk schedule,
 durable beacon fixation and successor, one-use probe release, exact Decimal80
 replay by a 2f+1 quorum, and atomic `verify_and_append`. One of four witnesses
 is deliberately unavailable in every trial. The driver reads the decision and
