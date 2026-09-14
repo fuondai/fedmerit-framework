@@ -16,6 +16,10 @@ dependencies = [
     "typing-extensions==4.15.0; python_version < '3.11'",
 ]
 
+[project.urls]
+Repository = "https://github.com/fuondai/fedmerit-framework"
+Issues = "https://github.com/fuondai/fedmerit-framework/issues"
+
 [project.scripts]
 fedmerit = "fedmerit.cli:main"
 

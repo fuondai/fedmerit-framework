@@ -30,7 +30,7 @@ python3 -m venv .venv
 .venv/bin/python -m pip install --no-deps .
 ```
 
-## Reviewer checks
+## Reference verification
 
 Validate the registered calculation contract and run the end-to-end protocol
 conformance path:

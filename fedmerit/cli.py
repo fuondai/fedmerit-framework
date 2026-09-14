@@ -78,7 +78,10 @@ def _positive_integer(value: Any, name: str) -> int:
 def _finite_number(value: Any, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be a finite number")
-    number = float(value)
+    try:
+        number = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite number") from exc
     if not math.isfinite(number):
         raise ValueError(f"{name} must be a finite number")
     return number

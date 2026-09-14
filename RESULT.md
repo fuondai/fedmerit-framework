@@ -1,39 +1,41 @@
-# Kết quả thực nghiệm FedMERIT trên UR3 CobotOps (Kaggle) — tự động sinh
+# Retained FedMERIT results on UR3 CobotOps
 
-File này được sinh tự động bởi `generate_report.py`, không chỉnh tay số liệu.
+This report is generated from the retained UR3 release metadata and preserves
+the recorded numerical values.
 
-## 1. Môi trường chạy
+## 1. Execution environment
 
-### Split random
+### Random split
 
-| Thư viện | Bản đã dùng | Bản chuẩn (repo) | Khớp? |
+| Library | Recorded version | Repository pin | Match |
 |---|---|---|---|
-| python | 3.12.13 | 3.12.13 | ✅ |
-| numpy | 2.0.2 | 2.0.2 | ✅ |
-| pandas | 2.3.3 | 2.3.3 | ✅ |
-| scikit_learn | 1.6.1 | 1.6.1 | ✅ |
-| scipy | 1.16.3 | 1.16.3 | ✅ |
-| cryptography | 43.0.3 | 43.0.3 | ✅ |
+| python | 3.12.13 | 3.12.13 | yes |
+| numpy | 2.0.2 | 2.0.2 | yes |
+| pandas | 2.3.3 | 2.3.3 | yes |
+| scikit_learn | 1.6.1 | 1.6.1 | yes |
+| scipy | 1.16.3 | 1.16.3 | yes |
+| cryptography | 43.0.3 | 43.0.3 | yes |
 
-### Split blocked
+### Blocked split
 
-| Thư viện | Bản đã dùng | Bản chuẩn (repo) | Khớp? |
+| Library | Recorded version | Repository pin | Match |
 |---|---|---|---|
-| python | 3.12.13 | 3.12.13 | ✅ |
-| numpy | 2.0.2 | 2.0.2 | ✅ |
-| pandas | 2.3.3 | 2.3.3 | ✅ |
-| scikit_learn | 1.6.1 | 1.6.1 | ✅ |
-| scipy | 1.16.3 | 1.16.3 | ✅ |
-| cryptography | 43.0.3 | 43.0.3 | ✅ |
+| python | 3.12.13 | 3.12.13 | yes |
+| numpy | 2.0.2 | 2.0.2 | yes |
+| pandas | 2.3.3 | 2.3.3 | yes |
+| scikit_learn | 1.6.1 | 1.6.1 | yes |
+| scipy | 1.16.3 | 1.16.3 | yes |
+| cryptography | 43.0.3 | 43.0.3 | yes |
 
-## 2. Đối chiếu với lý thuyết paper (Table I)
+## 2. Reference group counts
 
-Các giá trị n hợp lệ theo Table I: [38, 67, 103, 154, 169, 231, 410]
-(xem chi tiết khớp/lệch ở mục 5 nếu group_count không nằm trong danh sách này.)
+The registered calculation contract contains the following reference group
+counts: [38, 67, 103, 154, 169, 231, 410].
 
-## 3. Kết quả chính — FedMERIT có chặn được model có hại không?
+## 3. Retained transition outcomes
 
-(ref = số liệu có sẵn trong repo, `results/ur3_v4_random` và `results/ur3_v4_blocked`)
+The `ref` columns are the values retained in `results/ur3_v4_random` and
+`results/ur3_v4_blocked`.
 
 | | random: transitions | random: transitions (ref) | random: catalog_harmful | random: catalog_harmful (ref) | random: catalog_escapes | random: catalog_escapes (ref) | random: audit_diag_harmful | random: audit_diag_harmful (ref) | random: audit_diag_escapes | random: audit_diag_escapes (ref) |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -43,12 +45,13 @@ Các giá trị n hợp lệ theo Table I: [38, 67, 103, 154, 169, 231, 410]
 |---|---|---|---|---|---|---|---|---|---|---|
 | blocked | 480 | 480 | 38 | 38 | 0 | 0 | 170 | 170 | 0 | 0 |
 
-**Kết luận:** Không phát hiện lệch — catalog_escapes = 0 ở cả 2 split, khớp Table I, khớp môi trường chuẩn.
+The retained and recomputed values agree for both splits; catalog escapes are
+zero in each split and the recorded environments match the repository pins.
 
-## 4. Output thô của `validate_ur3_release`
+## 4. `validate_ur3_release` output
 
 ```json
-random (của mình): {
+random: {
   "split": "random",
   "transitions": 480,
   "seeds": 20,
@@ -57,7 +60,7 @@ random (của mình): {
   "audit_diagnostic_harmful": 54,
   "audit_diagnostic_escapes": 0
 }
-blocked (của mình): {
+blocked: {
   "split": "blocked",
   "transitions": 480,
   "seeds": 20,
@@ -68,11 +71,12 @@ blocked (của mình): {
 }
 ```
 
-## 5. Có gì lệch không?
+## 5. Consistency check
 
-- [x] Không phát hiện lệch — tất cả số liệu khớp Table I và khớp bản của anh.
+- [x] Retained values agree with the release summaries and the registered
+  calculation contract.
 
-## 6. Thư mục kết quả gốc
+## 6. Original result directories
 
 - random: `/kaggle/working/results/ur3_v4_random_reproduced`
 - blocked: `/kaggle/working/results/ur3_v4_blocked_reproduced`
