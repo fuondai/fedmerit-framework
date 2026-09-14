@@ -172,7 +172,7 @@ def main() -> None:
             gridspec_kw={"width_ratios": (1.20, 1.60, 1.20)},
         )
         figure.subplots_adjust(
-            left=0.052, right=0.970, bottom=0.25, top=0.87, wspace=0.20
+            left=0.065, right=0.970, bottom=0.25, top=0.79, wspace=0.48
         )
         method_x = np.arange(len(METHODS))
 
@@ -204,19 +204,21 @@ def main() -> None:
                 zorder=2,
             )
         axis.set_ylim(0, 110)
+        axis.set_yticks([0, 25, 50, 75, 100])
         axis.set_ylabel("Harmful installs (%)")
         axis.set_xticks(safety_x, [item[0] for item in evidence])
         axis.legend(
             frameon=False,
             loc="upper center",
-            bbox_to_anchor=(0.50, 1.17),
+            bbox_to_anchor=(0.50, 1.32),
             ncol=3,
             handlelength=0.9,
             columnspacing=0.65,
             borderpad=0.0,
         )
         axis.text(
-            0.02, 0.95, "(a)", transform=axis.transAxes, fontweight="bold", fontsize=8.0
+            0.0, 1.04, "(a)", transform=axis.transAxes, fontweight="bold",
+            fontsize=8.0, va="bottom", clip_on=False
         )
         _configure(axis)
 
@@ -259,7 +261,8 @@ def main() -> None:
             np.arange(len(ATTACKS)), [ATTACK_LABELS[item] for item in ATTACKS]
         )
         axis.text(
-            0.02, 0.93, "(b)", transform=axis.transAxes, fontweight="bold", fontsize=8.0
+            0.0, 1.04, "(b)", transform=axis.transAxes, fontweight="bold",
+            fontsize=8.0, va="bottom", clip_on=False
         )
         _configure(axis, grid=False)
 
@@ -295,6 +298,7 @@ def main() -> None:
             zorder=3,
         )
         axis.set_ylabel("Protocol time (ms)")
+        axis.set_yticks([4250, 4500, 4750, 5000, 5250])
         axis.yaxis.set_label_position("right")
         axis.set_xticks(
             method_x,
@@ -306,14 +310,15 @@ def main() -> None:
         axis.legend(
             frameon=False,
             loc="upper center",
-            bbox_to_anchor=(0.55, 1.10),
+            bbox_to_anchor=(0.55, 1.32),
             ncol=2,
             handlelength=1.0,
             columnspacing=0.8,
             borderpad=0.0,
         )
         axis.text(
-            0.02, 0.93, "(c)", transform=axis.transAxes, fontweight="bold", fontsize=8.0
+            0.0, 1.04, "(c)", transform=axis.transAxes, fontweight="bold",
+            fontsize=8.0, va="bottom", clip_on=False
         )
         _configure(axis)
 
